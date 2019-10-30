@@ -74,6 +74,13 @@ class Device(TestModel):
     host = ForeignKeyField(Host, backref='+')
     name = TextField()
 
+class Basket(TestModel):
+    id = IntegerField(primary_key=True)
+
+class Item(TestModel):
+    id = IntegerField(primary_key=True)
+    basket = ForeignKeyField(Basket)
+
 
 class TestModelToDict(ModelTestCase):
     database = get_in_memory_db()
@@ -448,6 +455,17 @@ class TestModelToDict(ModelTestCase):
             {'id': 1, 'name': 'ssh'},
             {'id': 2, 'name': 'vpn'}])
 
+    @requires_models(Basket, Item)
+    def test_empty_vs_null_fk(self):
+        b = Basket.create(id=0)
+        i = Item.create(id=0, basket=b)
+
+        data = model_to_dict(i)
+        self.assertEqual(data, {'id': 0, 'basket': {'id': 0}})
+
+        data = model_to_dict(i, recurse=False)
+        self.assertEqual(data, {'id': 0, 'basket': 0})
+
 
 class TestDictToModel(ModelTestCase):
     database = get_in_memory_db()
@@ -533,6 +551,28 @@ class TestDictToModel(ModelTestCase):
 
         inst = dict_to_model(User, data, ignore_unknown=True)
         self.assertEqual(inst.xx, 'does not exist')
+
+    def test_ignore_id_attribute(self):
+        class Register(Model):
+            key = CharField(primary_key=True)
+
+        data = {'id': 100, 'key': 'k1'}
+        self.assertRaises(AttributeError, dict_to_model, Register, data)
+
+        inst = dict_to_model(Register, data, ignore_unknown=True)
+        self.assertEqual(inst.__data__, {'key': 'k1'})
+
+        class Base(Model):
+            class Meta:
+                primary_key = False
+
+        class Register2(Model):
+            key = CharField(primary_key=True)
+
+        self.assertRaises(AttributeError, dict_to_model, Register2, data)
+
+        inst = dict_to_model(Register2, data, ignore_unknown=True)
+        self.assertEqual(inst.__data__, {'key': 'k1'})
 
 
 class ReconnectMySQLDatabase(ReconnectMixin, MySQLDatabase):

@@ -1,3 +1,5 @@
+import json
+
 try:
     import mysql.connector as mysql_connector
 except ImportError:
@@ -5,22 +7,43 @@ except ImportError:
 
 from peewee import ImproperlyConfigured
 from peewee import MySQLDatabase
+from peewee import NodeList
+from peewee import SQL
+from peewee import TextField
+from peewee import fn
 
 
 class MySQLConnectorDatabase(MySQLDatabase):
     def _connect(self):
         if mysql_connector is None:
             raise ImproperlyConfigured('MySQL connector not installed!')
-        conn = mysql_connector.connect(db=self.database, **self.connect_params)
-        if self._server_version is None:
-            # MySQL-Connector supports getting the version as a tuple, but this
-            # method does not return the proper MariaDB version on systems like
-            # Ubuntu, which express the version as 5.5.5-10.0.37-MariaDB-...
-            version_raw = conn.get_server_info()
-            self._server_version = self._extract_server_version(version_raw)
-        return conn
+        return mysql_connector.connect(db=self.database, **self.connect_params)
 
     def cursor(self, commit=None):
         if self.is_closed():
-            self.connect()
+            if self.autoconnect:
+                self.connect()
+            else:
+                raise InterfaceError('Error, database connection not opened.')
         return self._state.conn.cursor(buffered=True)
+
+
+class JSONField(TextField):
+    field_type = 'JSON'
+
+    def db_value(self, value):
+        if value is not None:
+            return json.dumps(value)
+
+    def python_value(self, value):
+        if value is not None:
+            return json.loads(value)
+
+
+def Match(columns, expr, modifier=None):
+    if isinstance(columns, (list, tuple)):
+        match = fn.MATCH(*columns)  # Tuple of one or more columns / fields.
+    else:
+        match = fn.MATCH(columns)  # Single column / field.
+    args = expr if modifier is None else NodeList((expr, SQL(modifier)))
+    return NodeList((match, fn.AGAINST(args)))

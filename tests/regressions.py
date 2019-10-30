@@ -1,6 +1,7 @@
 import datetime
 
 from peewee import *
+from playhouse.hybrid import *
 
 from .base import BaseTestCase
 from .base import IS_MYSQL
@@ -322,7 +323,7 @@ class TestReturningIntegrationRegressions(ModelTestCase):
                 .where(Tweet.user == User.id))
         query = (User
                  .update(username=(User.username + '-x'))
-                 .returning(subq, User.username))
+                 .returning(subq.alias('ct'), User.username))
         result = query.execute()
         self.assertEqual(sorted([(r.ct, r.username) for r in result]), [
             (0, 'zaizee-x'), (2, 'mickey-x'), (3, 'huey-x')])
@@ -556,3 +557,444 @@ class TestZeroTimestamp(ModelTestCase):
         t1_db = TS.get(TS.key == 't1')
         self.assertEqual(t1_db.timestamp,
                          datetime.datetime(1970, 1, 1, 0, 0, 1))
+
+
+class Player(TestModel):
+    name = TextField()
+
+class Game(TestModel):
+    name = TextField()
+    player = ForeignKeyField(Player)
+
+class Score(TestModel):
+    game = ForeignKeyField(Game)
+    points = IntegerField()
+
+
+class TestJoinSubqueryAggregateViaLeftOuter(ModelTestCase):
+    requires = [Player, Game, Score]
+
+    def test_join_subquery_aggregate_left_outer(self):
+        with self.database.atomic():
+            p1, p2 = [Player.create(name=name) for name in ('p1', 'p2')]
+            games = []
+            for p in (p1, p2):
+                for gnum in (1, 2):
+                    g = Game.create(name='%s-g%s' % (p.name, gnum), player=p)
+                    games.append(g)
+
+            score_list = (
+                (10, 20, 30),
+                (),
+                (100, 110, 100),
+                (50, 50))
+            for g, plist in zip(games, score_list):
+                for p in plist:
+                    Score.create(game=g, points=p)
+
+        subq = (Game
+                .select(Game.player, fn.SUM(Score.points).alias('ptotal'),
+                        fn.AVG(Score.points).alias('pavg'))
+                .join(Score, JOIN.LEFT_OUTER)
+                .group_by(Game.player))
+        query = (Player
+                 .select(Player, subq.c.ptotal, subq.c.pavg)
+                 .join(subq, on=(Player.id == subq.c.player_id))
+                 .order_by(Player.name))
+
+        with self.assertQueryCount(1):
+            results = [(p.name, p.game.ptotal, p.game.pavg) for p in query]
+
+        self.assertEqual(results, [('p1', 60, 20), ('p2', 410, 82)])
+
+        with self.assertQueryCount(1):
+            obj_query = query.objects()
+            results = [(p.name, p.ptotal, p.pavg) for p in obj_query]
+
+        self.assertEqual(results, [('p1', 60, 20), ('p2', 410, 82)])
+
+
+class Project(TestModel):
+    name = TextField()
+
+class Task(TestModel):
+    name = TextField()
+    project = ForeignKeyField(Project, backref='tasks')
+    alt = ForeignKeyField(Project, backref='alt_tasks')
+
+
+class TestModelGraphMultiFK(ModelTestCase):
+    requires = [Project, Task]
+
+    def test_model_graph_multi_fk(self):
+        pa, pb, pc = [Project.create(name=name) for name in 'abc']
+        t1 = Task.create(name='t1', project=pa, alt=pc)
+        t2 = Task.create(name='t2', project=pb, alt=pb)
+
+        P1 = Project.alias('p1')
+        P2 = Project.alias('p2')
+        LO = JOIN.LEFT_OUTER
+
+        # Query using join expression.
+        q1 = (Task
+              .select(Task, P1, P2)
+              .join_from(Task, P1, LO, on=(Task.project == P1.id))
+              .join_from(Task, P2, LO, on=(Task.alt == P2.id))
+              .order_by(Task.name))
+
+        # Query specifying target field.
+        q2 = (Task
+              .select(Task, P1, P2)
+              .join_from(Task, P1, LO, on=Task.project)
+              .join_from(Task, P2, LO, on=Task.alt)
+              .order_by(Task.name))
+
+        # Query specifying with missing target field.
+        q3 = (Task
+              .select(Task, P1, P2)
+              .join_from(Task, P1, LO)
+              .join_from(Task, P2, LO, on=Task.alt)
+              .order_by(Task.name))
+
+        for query in (q1, q2, q3):
+            with self.assertQueryCount(1):
+                t1, t2 = list(query)
+                self.assertEqual(t1.project.name, 'a')
+                self.assertEqual(t1.alt.name, 'c')
+                self.assertEqual(t2.project.name, 'b')
+                self.assertEqual(t2.alt.name, 'b')
+
+
+class TestBlobFieldContextRegression(BaseTestCase):
+    def test_blob_field_context_regression(self):
+        class A(Model):
+            f = BlobField()
+
+        orig = A.f._constructor
+        db = get_in_memory_db()
+        with db.bind_ctx([A]):
+            self.assertTrue(A.f._constructor is db.get_binary_type())
+
+        self.assertTrue(A.f._constructor is orig)
+
+
+class Product(TestModel):
+    id = CharField()
+    color = CharField()
+    class Meta:
+        primary_key = CompositeKey('id', 'color')
+
+class Sku(TestModel):
+    upc = CharField(primary_key=True)
+    product_id = CharField()
+    color = CharField()
+    class Meta:
+        constraints = [SQL('FOREIGN KEY (product_id, color) REFERENCES '
+                           'product(id, color)')]
+
+    @hybrid_property
+    def product(self):
+        if not hasattr(self, '_product'):
+            self._product = Product.get((Product.id == self.product_id) &
+                                        (Product.color == self.color))
+        return self._product
+
+    @product.setter
+    def product(self, obj):
+        self._product = obj
+        self.product_id = obj.id
+        self.color = obj.color
+
+    @product.expression
+    def product(cls):
+        return (Product.id == cls.product_id) & (Product.color == cls.color)
+
+
+class TestFKCompositePK(ModelTestCase):
+    requires = [Product, Sku]
+
+    def test_fk_composite_pk_regression(self):
+        Product.insert_many([
+            (1, 'red'),
+            (1, 'blue'),
+            (2, 'red'),
+            (2, 'green'),
+            (3, 'white')]).execute()
+        Sku.insert_many([
+            ('1-red', 1, 'red'),
+            ('1-blue', 1, 'blue'),
+            ('2-red', 2, 'red'),
+            ('2-green', 2, 'green'),
+            ('3-white', 3, 'white')]).execute()
+
+        query = (Product
+                 .select(Product, Sku)
+                 .join(Sku, on=Sku.product)
+                 .where(Product.color == 'red')
+                 .order_by(Product.id, Product.color))
+        with self.assertQueryCount(1):
+            rows = [(p.id, p.color, p.sku.upc) for p in query]
+            self.assertEqual(rows, [
+                ('1', 'red', '1-red'),
+                ('2', 'red', '2-red')])
+
+        query = (Sku
+                 .select(Sku, Product)
+                 .join(Product, on=Sku.product)
+                 .where(Product.color != 'red')
+                 .order_by(Sku.upc))
+        with self.assertQueryCount(1):
+            rows = [(s.upc, s.product_id, s.color,
+                     s.product.id, s.product.color) for s in query]
+            self.assertEqual(rows, [
+                ('1-blue', '1', 'blue', '1', 'blue'),
+                ('2-green', '2', 'green', '2', 'green'),
+                ('3-white', '3', 'white', '3', 'white')])
+
+
+class RS(TestModel):
+    name = TextField()
+
+class RD(TestModel):
+    key = TextField()
+    value = IntegerField()
+    rs = ForeignKeyField(RS, backref='rds')
+
+class RKV(TestModel):
+    key = CharField(max_length=10)
+    value = IntegerField()
+    extra = IntegerField()
+    class Meta:
+        primary_key = CompositeKey('key', 'value')
+
+
+class TestRegressionCountDistinct(ModelTestCase):
+    @requires_models(RS, RD)
+    def test_regression_count_distinct(self):
+        rs = RS.create(name='rs')
+
+        nums = [0, 1, 2, 3, 2, 1, 0]
+        RD.insert_many([('k%s' % i, i, rs) for i in nums]).execute()
+
+        query = RD.select(RD.key).distinct()
+        self.assertEqual(query.count(), 4)
+
+        # Try re-selecting using the id/key, which are all distinct.
+        query = query.select(RD.id, RD.key)
+        self.assertEqual(query.count(), 7)
+
+        # Re-select the key/value, of which there are 4 distinct.
+        query = query.select(RD.key, RD.value)
+        self.assertEqual(query.count(), 4)
+
+        query = rs.rds.select(RD.key).distinct()
+        self.assertEqual(query.count(), 4)
+
+        query = rs.rds.select(RD.key, RD.value).distinct()
+        self.assertEqual(query.count(), 4)  # Was returning 7!
+
+    @requires_models(RKV)
+    def test_regression_count_distinct_cpk(self):
+        RKV.insert_many([('k%s' % i, i, i) for i in range(5)]).execute()
+        self.assertEqual(RKV.select().distinct().count(), 5)
+
+
+class TestReselectModelRegression(ModelTestCase):
+    requires = [User]
+
+    def test_reselect_model_regression(self):
+        u1, u2, u3 = [User.create(username='u%s' % i) for i in '123']
+
+        query = User.select(User.username).order_by(User.username.desc())
+        self.assertEqual(list(query.tuples()), [('u3',), ('u2',), ('u1',)])
+
+        query = query.select(User)
+        self.assertEqual(list(query.tuples()), [
+            (u3.id, 'u3',),
+            (u2.id, 'u2',),
+            (u1.id, 'u1',)])
+
+
+class TestJoinCorrelatedSubquery(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_join_correlated_subquery(self):
+        for i in range(3):
+            user = User.create(username='u%s' % i)
+            for j in range(i + 1):
+                Tweet.create(user=user, content='u%s-%s' % (i, j))
+
+        UA = User.alias()
+        subq = (UA
+                .select(UA.username)
+                .where(UA.username.in_(('u0', 'u2'))))
+
+        query = (Tweet
+                 .select(Tweet, User)
+                 .join(User, on=(
+                     (Tweet.user == User.id) &
+                     (User.username.in_(subq))))
+                 .order_by(Tweet.id))
+
+        with self.assertQueryCount(1):
+            data = [(t.content, t.user.username) for t in query]
+            self.assertEqual(data, [
+                ('u0-0', 'u0'),
+                ('u2-0', 'u2'),
+                ('u2-1', 'u2'),
+                ('u2-2', 'u2')])
+
+
+class RU(TestModel):
+    username = TextField()
+
+
+class Recipe(TestModel):
+    name = TextField()
+    created_by = ForeignKeyField(RU, backref='recipes')
+    changed_by = ForeignKeyField(RU, backref='recipes_modified')
+
+
+class TestMultiFKJoinRegression(ModelTestCase):
+    requires = [RU, Recipe]
+
+    def test_multi_fk_join_regression(self):
+        u1, u2 = [RU.create(username=u) for u in ('u1', 'u2')]
+        for (n, a, m) in (('r11', u1, u1), ('r12', u1, u2), ('r21', u2, u1)):
+            Recipe.create(name=n, created_by=a, changed_by=m)
+
+        Change = RU.alias()
+        query = (Recipe
+                 .select(Recipe, RU, Change)
+                 .join(RU, on=(RU.id == Recipe.created_by).alias('a'))
+                 .switch(Recipe)
+                 .join(Change, on=(Change.id == Recipe.changed_by).alias('b'))
+                 .order_by(Recipe.name))
+        with self.assertQueryCount(1):
+            data = [(r.name, r.a.username, r.b.username) for r in query]
+            self.assertEqual(data, [
+                ('r11', 'u1', 'u1'),
+                ('r12', 'u1', 'u2'),
+                ('r21', 'u2', 'u1')])
+
+
+class TestCompoundExistsRegression(ModelTestCase):
+    requires = [User]
+
+    def test_compound_regressions_1961(self):
+        UA = User.alias()
+        cq = (User.select(User.id) | UA.select(UA.id))
+        # Calling .exists() fails with AttributeError, no attribute "columns".
+        self.assertFalse(cq.exists())
+        self.assertEqual(cq.count(), 0)
+
+        User.create(username='u1')
+        self.assertTrue(cq.exists())
+        self.assertEqual(cq.count(), 1)
+
+
+class TestViewFieldMapping(ModelTestCase):
+    requires = [User]
+
+    def tearDown(self):
+        try:
+            self.execute('drop view user_testview_fm')
+        except Exception as exc:
+            pass
+        super(TestViewFieldMapping, self).tearDown()
+
+    def test_view_field_mapping(self):
+        user = User.create(username='huey')
+        self.execute('create view user_testview_fm as '
+                     'select id, username from users')
+
+        class View(User):
+            class Meta:
+                table_name = 'user_testview_fm'
+
+        self.assertEqual([(v.id, v.username) for v in View.select()],
+                         [(user.id, 'huey')])
+
+
+class TC(TestModel):
+    ifield = IntegerField()
+    ffield = FloatField()
+    cfield = TextField()
+    tfield = TextField()
+
+
+class TestTypeCoercion(ModelTestCase):
+    requires = [TC]
+
+    def test_type_coercion(self):
+        t = TC.create(ifield='10', ffield='20.5', cfield=30, tfield=40)
+        t_db = TC.get(TC.id == t.id)
+
+        self.assertEqual(t_db.ifield, 10)
+        self.assertEqual(t_db.ffield, 20.5)
+        self.assertEqual(t_db.cfield, '30')
+        self.assertEqual(t_db.tfield, '40')
+
+
+class TestLikeColumnValue(ModelTestCase):
+    requires = [User, Tweet]
+
+    def test_like_column_value(self):
+        # e.g., find all tweets that contain the users own username.
+        u1, u2, u3 = [User.create(username='u%s' % i) for i in (1, 2, 3)]
+        data = (
+            (u1, ('nada', 'i am u1', 'u1 is my name')),
+            (u2, ('nothing', 'he is u1')),
+            (u3, ('she is u2', 'hey u3 is me', 'xx')))
+        for user, tweets in data:
+            Tweet.insert_many([(user, tweet) for tweet in tweets],
+                              fields=[Tweet.user, Tweet.content]).execute()
+
+        expressions = (
+            (Tweet.content ** ('%' + User.username + '%')),
+            Tweet.content.contains(User.username))
+
+        for expr in expressions:
+            query = (Tweet
+                     .select(Tweet, User)
+                     .join(User)
+                     .where(expr)
+                     .order_by(Tweet.id))
+
+            self.assertEqual([(t.user.username, t.content) for t in query], [
+                ('u1', 'i am u1'),
+                ('u1', 'u1 is my name'),
+                ('u3', 'hey u3 is me')])
+
+
+class TestUnionParenthesesRegression(ModelTestCase):
+    requires = [User]
+
+    def test_union_parentheses_regression(self):
+        ua, ub, uc = [User.create(username=u) for u in 'abc']
+        lhs = User.select(User.id).where(User.username == 'a')
+        rhs = User.select(User.id).where(User.username == 'c')
+        union = lhs.union_all(rhs)
+        self.assertEqual(sorted([u.id for u in union]), [ua.id, uc.id])
+
+        query = User.select().where(User.id.in_(union)).order_by(User.id)
+        self.assertEqual([u.username for u in query], ['a', 'c'])
+
+
+class NoPK(TestModel):
+    data = IntegerField()
+    class Meta:
+        primary_key = False
+
+
+class TestNoPKHashRegression(ModelTestCase):
+    requires = [NoPK]
+
+    def test_no_pk_hash_regression(self):
+        npk = NoPK.create(data=1)
+        npk_db = NoPK.get(NoPK.data == 1)
+        # When a model does not define a primary key, we cannot test equality.
+        self.assertTrue(npk != npk_db)
+
+        # Their hash is the same, though they are not equal.
+        self.assertEqual(hash(npk), hash(npk_db))

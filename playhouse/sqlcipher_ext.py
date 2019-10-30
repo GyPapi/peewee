@@ -53,7 +53,10 @@ from playhouse.sqlite_ext import SqliteExtDatabase
 if sys.version_info[0] != 3:
     from pysqlcipher import dbapi2 as sqlcipher
 else:
-    from pysqlcipher3 import dbapi2 as sqlcipher
+    try:
+        from sqlcipher3 import dbapi2 as sqlcipher
+    except ImportError:
+        from pysqlcipher3 import dbapi2 as sqlcipher
 
 sqlcipher.register_adapter(decimal.Decimal, str)
 sqlcipher.register_adapter(datetime.date, str)
@@ -65,8 +68,7 @@ class _SqlCipherDatabase(object):
         params = dict(self.connect_params)
         passphrase = params.pop('passphrase', '').replace("'", "''")
 
-        conn = sqlcipher.connect(self.database, **params)
-        conn.isolation_level = None
+        conn = sqlcipher.connect(self.database, isolation_level=None, **params)
         try:
             if passphrase:
                 conn.execute("PRAGMA key='%s'" % passphrase)

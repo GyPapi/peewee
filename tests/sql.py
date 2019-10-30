@@ -15,7 +15,7 @@ from .base import __sql__
 
 User = Table('users')
 Tweet = Table('tweets')
-Person = Table('person', ['id', 'name', 'dob'])
+Person = Table('person', ['id', 'name', 'dob'], primary_key='id')
 Note = Table('note', ['id', 'person_id', 'content'])
 
 
@@ -333,6 +333,22 @@ class TestSelectQuery(BaseTestCase):
             'SELECT "t1"."username" FROM "users" AS "t1" '
             'WHERE ("t1"."is_staff" = ?)) '
             'SELECT "c1"."username", "c2"."username" FROM "c1", "c2"'), [1, 1])
+
+    def test_materialize_cte(self):
+        cases = (
+            (True, 'MATERIALIZED '),
+            (False, 'NOT MATERIALIZED '),
+            (None, ''))
+        for materialized, clause in cases:
+            cte = (User
+                   .select(User.c.id)
+                   .cte('user_ids', materialized=materialized))
+            query = cte.select_from(cte.c.id).where(cte.c.id < 10)
+            self.assertSQL(query, (
+                'WITH "user_ids" AS %s('
+                'SELECT "t1"."id" FROM "users" AS "t1") '
+                'SELECT "user_ids"."id" FROM "user_ids" '
+                'WHERE ("user_ids"."id" < ?)') % clause, [10])
 
     def test_fibonacci_cte(self):
         q1 = Select(columns=(
@@ -655,6 +671,37 @@ class TestSelectQuery(BaseTestCase):
             'HAVING ("ct" > ?) '
             'ORDER BY "ct" DESC'), [1, 10])
 
+    def test_order_by_collate(self):
+        query = (User
+                 .select(User.c.username)
+                 .order_by(User.c.username.asc(collation='binary')))
+        self.assertSQL(query, (
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'ORDER BY "t1"."username" ASC COLLATE binary'), [])
+
+    def test_order_by_nulls(self):
+        query = (User
+                 .select(User.c.username)
+                 .order_by(User.c.ts.desc(nulls='LAST')))
+        self.assertSQL(query, (
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'ORDER BY "t1"."ts" DESC NULLS LAST'), [], nulls_ordering=True)
+        self.assertSQL(query, (
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'ORDER BY CASE WHEN ("t1"."ts" IS ?) THEN ? ELSE ? END, '
+            '"t1"."ts" DESC'), [None, 1, 0], nulls_ordering=False)
+
+        query = (User
+                 .select(User.c.username)
+                 .order_by(User.c.ts.desc(nulls='first')))
+        self.assertSQL(query, (
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'ORDER BY "t1"."ts" DESC NULLS first'), [], nulls_ordering=True)
+        self.assertSQL(query, (
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'ORDER BY CASE WHEN ("t1"."ts" IS ?) THEN ? ELSE ? END, '
+            '"t1"."ts" DESC'), [None, 0, 1], nulls_ordering=False)
+
     def test_in_value_representation(self):
         query = (User
                  .select(User.c.id)
@@ -716,6 +763,13 @@ class TestSelectQuery(BaseTestCase):
             'SELECT COUNT("t1"."id") FROM "stats" AS "t1" '
             'WHERE (("t1"."index" % ?) = ?)'), [10, 0])
 
+    def test_where_convert_to_is_null(self):
+        Note = Table('notes', ('id', 'content', 'user_id'))
+        query = Note.select().where(Note.user_id == None)
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."content", "t1"."user_id" '
+            'FROM "notes" AS "t1" WHERE ("t1"."user_id" IS ?)'), [None])
+
 
 class TestInsertQuery(BaseTestCase):
     def test_insert_simple(self):
@@ -768,6 +822,26 @@ class TestInsertQuery(BaseTestCase):
             'INSERT INTO "person" ("name") VALUES (?), (?), (?)'),
             ['charlie', 'huey', 'zaizee'])
 
+    def test_insert_list_infer_columns(self):
+        data = [('p1', '1980-01-01'), ('p2', '1980-02-02')]
+        self.assertSQL(Person.insert(data), (
+            'INSERT INTO "person" ("name", "dob") VALUES (?, ?), (?, ?)'),
+            ['p1', '1980-01-01', 'p2', '1980-02-02'])
+
+        # Cannot infer any columns for User.
+        data = [('u1',), ('u2',)]
+        self.assertRaises(ValueError, User.insert(data).sql)
+
+        # Note declares columns, but no primary key. So we would have to
+        # include it for this to work.
+        data = [(1, 'p1-n'), (2, 'p2-n')]
+        self.assertRaises(ValueError, Note.insert(data).sql)
+
+        data = [(1, 1, 'p1-n'), (2, 2, 'p2-n')]
+        self.assertSQL(Note.insert(data), (
+            'INSERT INTO "note" ("id", "person_id", "content") '
+            'VALUES (?, ?, ?), (?, ?, ?)'), [1, 1, 'p1-n', 2, 2, 'p2-n'])
+
     def test_insert_query(self):
         source = User.select(User.c.username).where(User.c.admin == False)
         query = Person.insert(source, columns=[Person.name])
@@ -805,6 +879,13 @@ class TestInsertQuery(BaseTestCase):
             'INSERT INTO "person" ("dob", "name") '
             'VALUES (?, ?) '
             'RETURNING "person"."id", "person"."name", "person"."dob"'),
+            [datetime.date(2000, 1, 2), 'zaizee'])
+
+        query = query.returning(Person.id, Person.name.alias('new_name'))
+        self.assertSQL(query, (
+            'INSERT INTO "person" ("dob", "name") '
+            'VALUES (?, ?) '
+            'RETURNING "person"."id", "person"."name" AS "new_name"'),
             [datetime.date(2000, 1, 2), 'zaizee'])
 
     def test_empty(self):
@@ -903,6 +984,12 @@ class TestUpdateQuery(BaseTestCase):
             'UPDATE "users" SET "is_admin" = ? WHERE ("users"."username" = ?) '
             'RETURNING "users"."id"'), [True, 'charlie'])
 
+        query = query.returning(User.c.is_admin.alias('new_is_admin'))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "is_admin" = ? WHERE ("users"."username" = ?) '
+            'RETURNING "users"."is_admin" AS "new_is_admin"'),
+            [True, 'charlie'])
+
 
 class TestDeleteQuery(BaseTestCase):
     def test_delete_query(self):
@@ -963,6 +1050,12 @@ class TestDeleteQuery(BaseTestCase):
             'DELETE FROM "users" '
             'WHERE ("users"."id" > ?) '
             'RETURNING "users"."id", "users"."username", 1'), [2])
+
+        query = query.returning(User.c.id.alias('old_id'))
+        self.assertSQL(query, (
+            'DELETE FROM "users" '
+            'WHERE ("users"."id" > ?) '
+            'RETURNING "users"."id" AS "old_id"'), [2])
 
 
 Register = Table('register', ('id', 'value', 'category'))
@@ -1245,6 +1338,122 @@ class TestWindowFunctions(BaseTestCase):
             'ORDER BY FIRST_VALUE("t1"."id") '
             'OVER (PARTITION BY "t1"."value" ORDER BY "t1"."id")'), [])
 
+    def test_window_extends(self):
+        Tbl = Table('tbl', ('b', 'c'))
+        w1 = Window(partition_by=[Tbl.b], alias='win1')
+        w2 = Window(extends=w1, order_by=[Tbl.c], alias='win2')
+        query = Tbl.select(fn.GROUP_CONCAT(Tbl.c).over(w2)).window(w1, w2)
+        self.assertSQL(query, (
+            'SELECT GROUP_CONCAT("t1"."c") OVER win2 FROM "tbl" AS "t1" '
+            'WINDOW win1 AS (PARTITION BY "t1"."b"), '
+            'win2 AS (win1 ORDER BY "t1"."c")'), [])
+
+        w1 = Window(partition_by=[Tbl.b], alias='w1')
+        w2 = Window(extends=w1).alias('w2')
+        w3 = Window(extends=w2).alias('w3')
+        w4 = Window(extends=w3, order_by=[Tbl.c]).alias('w4')
+        query = (Tbl
+                 .select(fn.GROUP_CONCAT(Tbl.c).over(w4))
+                 .window(w1, w2, w3, w4))
+        self.assertSQL(query, (
+            'SELECT GROUP_CONCAT("t1"."c") OVER w4 FROM "tbl" AS "t1" '
+            'WINDOW w1 AS (PARTITION BY "t1"."b"), w2 AS (w1), w3 AS (w2), '
+            'w4 AS (w3 ORDER BY "t1"."c")'), [])
+
+    def test_window_ranged(self):
+        Tbl = Table('tbl', ('a', 'b'))
+        query = (Tbl
+                 .select(Tbl.a, fn.SUM(Tbl.b).over(
+                     order_by=[Tbl.a.desc()],
+                     frame_type=Window.RANGE,
+                     start=Window.preceding(1),
+                     end=Window.following(2)))
+                 .order_by(Tbl.a.asc()))
+        self.assertSQL(query, (
+            'SELECT "t1"."a", SUM("t1"."b") OVER ('
+            'ORDER BY "t1"."a" DESC RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING)'
+            ' FROM "tbl" AS "t1" ORDER BY "t1"."a" ASC'), [])
+
+        query = (Tbl
+                 .select(Tbl.a, fn.SUM(Tbl.b).over(
+                     order_by=[Tbl.a],
+                     frame_type=Window.GROUPS,
+                     start=Window.preceding(3),
+                     end=Window.preceding(1))))
+        self.assertSQL(query, (
+            'SELECT "t1"."a", SUM("t1"."b") OVER ('
+            'ORDER BY "t1"."a" GROUPS BETWEEN 3 PRECEDING AND 1 PRECEDING) '
+            'FROM "tbl" AS "t1"'), [])
+
+        query = (Tbl
+                 .select(Tbl.a, fn.SUM(Tbl.b).over(
+                     order_by=[Tbl.a],
+                     frame_type=Window.GROUPS,
+                     start=Window.following(1),
+                     end=Window.following(5))))
+        self.assertSQL(query, (
+            'SELECT "t1"."a", SUM("t1"."b") OVER ('
+            'ORDER BY "t1"."a" GROUPS BETWEEN 1 FOLLOWING AND 5 FOLLOWING) '
+            'FROM "tbl" AS "t1"'), [])
+
+
+    def test_window_frametypes(self):
+        Tbl = Table('tbl', ('b', 'c'))
+        fts = (('as_range', Window.RANGE, 'RANGE'),
+               ('as_rows', Window.ROWS, 'ROWS'),
+               ('as_groups', Window.GROUPS, 'GROUPS'))
+        for method, arg, sql in fts:
+            w = getattr(Window(order_by=[Tbl.b + 1]), method)()
+            self.assertSQL(Tbl.select(fn.SUM(Tbl.c).over(w)).window(w), (
+                'SELECT SUM("t1"."c") OVER w FROM "tbl" AS "t1" '
+                'WINDOW w AS (ORDER BY ("t1"."b" + ?) '
+                '%s UNBOUNDED PRECEDING)') % sql, [1])
+
+            query = Tbl.select(fn.SUM(Tbl.c)
+                               .over(order_by=[Tbl.b + 1], frame_type=arg))
+            self.assertSQL(query, (
+                'SELECT SUM("t1"."c") OVER (ORDER BY ("t1"."b" + ?) '
+                '%s UNBOUNDED PRECEDING) FROM "tbl" AS "t1"') % sql, [1])
+
+    def test_window_frame_exclusion(self):
+        Tbl = Table('tbl', ('b', 'c'))
+        fts = ((Window.CURRENT_ROW, 'CURRENT ROW'),
+               (Window.TIES, 'TIES'),
+               (Window.NO_OTHERS, 'NO OTHERS'),
+               (Window.GROUP, 'GROUP'))
+        for arg, sql in fts:
+            query = Tbl.select(fn.MAX(Tbl.b).over(
+                order_by=[Tbl.c],
+                start=Window.preceding(4),
+                end=Window.following(),
+                frame_type=Window.ROWS,
+                exclude=arg))
+            self.assertSQL(query, (
+                'SELECT MAX("t1"."b") OVER (ORDER BY "t1"."c" '
+                'ROWS BETWEEN 4 PRECEDING AND UNBOUNDED FOLLOWING '
+                'EXCLUDE %s) FROM "tbl" AS "t1"') % sql, [])
+
+    def test_filter_window(self):
+        # Example derived from sqlite window test 5.1.3.2.
+        Tbl = Table('tbl', ('a', 'c'))
+        win = Window(partition_by=fn.COALESCE(Tbl.a, ''),
+                     frame_type=Window.RANGE,
+                     start=Window.CURRENT_ROW,
+                     end=Window.following(),
+                     exclude=Window.NO_OTHERS)
+        query = (Tbl
+                 .select(fn.SUM(Tbl.c).filter(Tbl.c < 5).over(win),
+                         fn.RANK().over(win),
+                         fn.DENSE_RANK().over(win))
+                 .window(win))
+        self.assertSQL(query, (
+            'SELECT SUM("t1"."c") FILTER (WHERE ("t1"."c" < ?)) OVER w, '
+            'RANK() OVER w, DENSE_RANK() OVER w '
+            'FROM "tbl" AS "t1" '
+            'WINDOW w AS (PARTITION BY COALESCE("t1"."a", ?) '
+            'RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING '
+            'EXCLUDE NO OTHERS)'), [5, ''])
+
 
 class TestValuesList(BaseTestCase):
     _data = [(1, 'one'), (2, 'two'), (3, 'three')]
@@ -1465,7 +1674,7 @@ class TestOnConflictMySQL(BaseTestCase):
 
     def setUp(self):
         super(TestOnConflictMySQL, self).setUp()
-        self.database._server_version = None
+        self.database.server_version = None
 
     def test_replace(self):
         query = Person.insert(name='huey').on_conflict('replace')
@@ -1504,13 +1713,13 @@ class TestOnConflictMySQL(BaseTestCase):
         query = (Person
                  .insert(name='huey', dob=dob)
                  .on_conflict(preserve=(Person.dob,)))
-        self.database._server_version = (10, 3, 3)
+        self.database.server_version = (10, 3, 3)
         self.assertSQL(query, (
             'INSERT INTO "person" ("dob", "name") VALUES (?, ?) '
             'ON DUPLICATE KEY '
             'UPDATE "dob" = VALUE("dob")'), [dob, 'huey'])
 
-        self.database._server_version = (10, 3, 2)
+        self.database.server_version = (10, 3, 2)
         self.assertSQL(query, (
             'INSERT INTO "person" ("dob", "name") VALUES (?, ?) '
             'ON DUPLICATE KEY '
@@ -1542,6 +1751,19 @@ class TestOnConflictPostgresql(BaseTestCase):
         query = Person.insert(name='huey').on_conflict(conflict_target='name')
         with self.assertRaisesCtx(ValueError):
             self.database.get_sql_context().parse(query)
+
+    def test_conflict_update_excluded(self):
+        KV = Table('kv', ('key', 'value', 'extra'), _database=self.database)
+
+        query = (KV.insert(key='k1', value='v1', extra=1)
+                 .on_conflict(conflict_target=(KV.key, KV.value),
+                              update={KV.extra: EXCLUDED.extra + 2},
+                              where=(EXCLUDED.extra < KV.extra)))
+        self.assertSQL(query, (
+            'INSERT INTO "kv" ("extra", "key", "value") VALUES (?, ?, ?) '
+            'ON CONFLICT ("key", "value") DO UPDATE '
+            'SET "extra" = (EXCLUDED."extra" + ?) '
+            'WHERE (EXCLUDED."extra" < "kv"."extra")'), [1, 'k1', 'v1', 2])
 
     def test_conflict_target_or_constraint(self):
         KV = Table('kv', ('key', 'value', 'extra'), _database=self.database)

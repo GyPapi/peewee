@@ -11,6 +11,8 @@ from cpython.object cimport PyObject
 from cpython.ref cimport Py_INCREF, Py_DECREF
 from cpython.unicode cimport PyUnicode_AsUTF8String
 from cpython.unicode cimport PyUnicode_Check
+from cpython.unicode cimport PyUnicode_DecodeUTF8
+from cpython.version cimport PY_MAJOR_VERSION
 from libc.float cimport DBL_MAX
 from libc.math cimport ceil, log, sqrt
 from libc.math cimport pow as cpow
@@ -29,10 +31,10 @@ import traceback
 
 
 cdef struct sqlite3_index_constraint:
-    int iColumn
-    unsigned char op
-    unsigned char usable
-    int iTermOffset
+    int iColumn  # Column constrained, -1 for rowid.
+    unsigned char op  # Constraint operator.
+    unsigned char usable  # True if this constraint is usable.
+    int iTermOffset  # Used internally - xBestIndex should ignore.
 
 
 cdef struct sqlite3_index_orderby:
@@ -41,7 +43,7 @@ cdef struct sqlite3_index_orderby:
 
 
 cdef struct sqlite3_index_constraint_usage:
-    int argvIndex
+    int argvIndex  # if > 0, constraint is part of argv to xFilter.
     unsigned char omit
 
 
@@ -80,9 +82,9 @@ cdef extern from "sqlite3.h" nogil:
 
     ctypedef struct sqlite3_module:
         int iVersion
-        int (*xCreate)(sqlite3*, void *pAux, int argc, char **argv,
+        int (*xCreate)(sqlite3*, void *pAux, int argc, const char *const*argv,
                        sqlite3_vtab **ppVTab, char**)
-        int (*xConnect)(sqlite3*, void *pAux, int argc, char **argv,
+        int (*xConnect)(sqlite3*, void *pAux, int argc, const char *const*argv,
                         sqlite3_vtab **ppVTab, char**)
         int (*xBestIndex)(sqlite3_vtab *pVTab, sqlite3_index_info*)
         int (*xDisconnect)(sqlite3_vtab *pVTab)
@@ -164,6 +166,8 @@ cdef extern from "sqlite3.h" nogil:
     cdef int sqlite3_value_numeric_type(sqlite3_value*)
 
     # Converting from Python -> Sqlite.
+    cdef void sqlite3_result_blob(sqlite3_context*, const void *, int,
+                                  void(*)(void*))
     cdef void sqlite3_result_double(sqlite3_context*, double)
     cdef void sqlite3_result_error(sqlite3_context*, const char*, int)
     cdef void sqlite3_result_error_toobig(sqlite3_context*)
@@ -285,8 +289,73 @@ cdef extern from "_pysqlite/connection.h":
         sqlite3* db
         double timeout
         int initialized
-        PyObject* isolation_level
-        char* begin_statement
+
+
+cdef sqlite_to_python(int argc, sqlite3_value **params):
+    cdef:
+        int i
+        int vtype
+        list pyargs = []
+
+    for i in range(argc):
+        vtype = sqlite3_value_type(params[i])
+        if vtype == SQLITE_INTEGER:
+            pyval = sqlite3_value_int(params[i])
+        elif vtype == SQLITE_FLOAT:
+            pyval = sqlite3_value_double(params[i])
+        elif vtype == SQLITE_TEXT:
+            pyval = PyUnicode_DecodeUTF8(
+                <const char *>sqlite3_value_text(params[i]),
+                <Py_ssize_t>sqlite3_value_bytes(params[i]), NULL)
+        elif vtype == SQLITE_BLOB:
+            pyval = PyBytes_FromStringAndSize(
+                <const char *>sqlite3_value_blob(params[i]),
+                <Py_ssize_t>sqlite3_value_bytes(params[i]))
+        elif vtype == SQLITE_NULL:
+            pyval = None
+        else:
+            pyval = None
+
+        pyargs.append(pyval)
+
+    return pyargs
+
+
+cdef python_to_sqlite(sqlite3_context *context, value):
+    if value is None:
+        sqlite3_result_null(context)
+    elif isinstance(value, (int, long)):
+        sqlite3_result_int64(context, <sqlite3_int64>value)
+    elif isinstance(value, float):
+        sqlite3_result_double(context, <double>value)
+    elif isinstance(value, unicode):
+        bval = PyUnicode_AsUTF8String(value)
+        sqlite3_result_text(
+            context,
+            <const char *>bval,
+            len(bval),
+            <sqlite3_destructor_type>-1)
+    elif isinstance(value, bytes):
+        if PY_MAJOR_VERSION > 2:
+            sqlite3_result_blob(
+                context,
+                <void *>(<char *>value),
+                len(value),
+                <sqlite3_destructor_type>-1)
+        else:
+            sqlite3_result_text(
+                context,
+                <const char *>value,
+                len(value),
+                <sqlite3_destructor_type>-1)
+    else:
+        sqlite3_result_error(
+            context,
+            encode('Unsupported type %s' % type(value)),
+            -1)
+        return SQLITE_ERROR
+
+    return SQLITE_OK
 
 
 cdef int SQLITE_CONSTRAINT = 19  # Abort due to constraint violation.
@@ -314,12 +383,12 @@ ctypedef struct peewee_cursor:
 
 # We define an xConnect function, but leave xCreate NULL so that the
 # table-function can be called eponymously.
-cdef int pwConnect(sqlite3 *db, void *pAux, int argc, char **argv,
+cdef int pwConnect(sqlite3 *db, void *pAux, int argc, const char *const*argv,
                    sqlite3_vtab **ppVtab, char **pzErr) with gil:
     cdef:
         int rc
         object table_func_cls = <object>pAux
-        peewee_vtab *pNew
+        peewee_vtab *pNew = <peewee_vtab *>0
 
     rc = sqlite3_declare_vtab(
         db,
@@ -351,7 +420,7 @@ cdef int pwDisconnect(sqlite3_vtab *pBase) with gil:
 cdef int pwOpen(sqlite3_vtab *pBase, sqlite3_vtab_cursor **ppCursor) with gil:
     cdef:
         peewee_vtab *pVtab = <peewee_vtab *>pBase
-        peewee_cursor *pCur
+        peewee_cursor *pCur = <peewee_cursor *>0
         object table_func_cls = <object>pVtab.table_func_cls
 
     pCur = <peewee_cursor *>sqlite3_malloc(sizeof(pCur[0]))
@@ -428,30 +497,7 @@ cdef int pwColumn(sqlite3_vtab_cursor *pBase, sqlite3_context *ctx,
         return SQLITE_ERROR
 
     row_data = <tuple>pCur.row_data
-    value = row_data[iCol]
-    if value is None:
-        sqlite3_result_null(ctx)
-    elif isinstance(value, (int, long)):
-        sqlite3_result_int64(ctx, <sqlite3_int64>value)
-    elif isinstance(value, float):
-        sqlite3_result_double(ctx, <double>value)
-    elif isinstance(value, basestring):
-        bval = encode(value)
-        sqlite3_result_text(
-            ctx,
-            <const char *>bval,
-            -1,
-            <sqlite3_destructor_type>-1)
-    elif isinstance(value, bool):
-        sqlite3_result_int(ctx, int(value))
-    else:
-        sqlite3_result_error(
-            ctx,
-            encode('Unsupported type %s' % type(value)),
-            -1)
-        return SQLITE_ERROR
-
-    return SQLITE_OK
+    return python_to_sqlite(ctx, row_data[iCol])
 
 
 cdef int pwRowid(sqlite3_vtab_cursor *pBase, sqlite3_int64 *pRowid):
@@ -465,9 +511,7 @@ cdef int pwRowid(sqlite3_vtab_cursor *pBase, sqlite3_int64 *pRowid):
 cdef int pwEof(sqlite3_vtab_cursor *pBase):
     cdef:
         peewee_cursor *pCur = <peewee_cursor *>pBase
-    if pCur.stopped:
-        return 1
-    return 0
+    return 1 if pCur.stopped else 0
 
 
 # The filter method is called on the first iteration. This method is where we
@@ -486,30 +530,19 @@ cdef int pwFilter(sqlite3_vtab_cursor *pBase, int idxNum,
 
     if not idxStr or argc == 0 and len(table_func.params):
         return SQLITE_ERROR
-    elif idxStr:
+    elif len(idxStr):
         params = decode(idxStr).split(',')
     else:
         params = []
+
+    py_values = sqlite_to_python(argc, argv)
 
     for idx, param in enumerate(params):
         value = argv[idx]
         if not value:
             query[param] = None
-            continue
-
-        value_type = sqlite3_value_type(value)
-        if value_type == SQLITE_INTEGER:
-            query[param] = sqlite3_value_int(value)
-        elif value_type == SQLITE_FLOAT:
-            query[param] = sqlite3_value_double(value)
-        elif value_type == SQLITE_TEXT:
-            query[param] = decode(sqlite3_value_text(value))
-        elif value_type == SQLITE_BLOB:
-            query[param] = <bytes>sqlite3_value_blob(value)
-        elif value_type == SQLITE_NULL:
-            query[param] = None
         else:
-            query[param] = None
+            query[param] = py_values[idx]
 
     try:
         table_func.initialize(**query)
@@ -543,14 +576,13 @@ cdef int pwBestIndex(sqlite3_vtab *pBase, sqlite3_index_info *pIdxInfo) \
         int idxNum = 0, nArg = 0
         peewee_vtab *pVtab = <peewee_vtab *>pBase
         object table_func_cls = <object>pVtab.table_func_cls
-        sqlite3_index_constraint *pConstraint
+        sqlite3_index_constraint *pConstraint = <sqlite3_index_constraint *>0
         list columns = []
         char *idxStr
         int nParams = len(table_func_cls.params)
 
-    pConstraint = <sqlite3_index_constraint*>0
     for i in range(pIdxInfo.nConstraint):
-        pConstraint = &pIdxInfo.aConstraint[i]
+        pConstraint = pIdxInfo.aConstraint + i
         if not pConstraint.usable:
             continue
         if pConstraint.op != SQLITE_INDEX_CONSTRAINT_EQ:
@@ -562,7 +594,7 @@ cdef int pwBestIndex(sqlite3_vtab *pBase, sqlite3_index_info *pIdxInfo) \
         pIdxInfo.aConstraintUsage[i].argvIndex = nArg
         pIdxInfo.aConstraintUsage[i].omit = 1
 
-    if nArg > 0:
+    if nArg > 0 or nParams == 0:
         if nArg == nParams:
             # All parameters are present, this is ideal.
             pIdxInfo.estimatedCost = <double>1
@@ -1065,7 +1097,7 @@ seeds[:] = [0, 1337, 37, 0xabcd, 0xdead, 0xface, 97, 0xed11, 0xcad9, 0x827b]
 
 
 cdef bf_t *bf_create(size_t size):
-    cdef bf_t *bf = <bf_t *>calloc(1, sizeof(bf[0]))
+    cdef bf_t *bf = <bf_t *>calloc(1, sizeof(bf_t))
     bf.size = size
     bf.bits = malloc(size)
     return bf
@@ -1417,7 +1449,7 @@ cdef class ConnectionHelper(object):
         Replace the default busy handler with one that introduces some "jitter"
         into the amount of time delayed between checks.
         """
-        cdef int n = timeout * 1000
+        cdef sqlite3_int64 n = timeout * 1000
         sqlite3_busy_handler(self.conn.db, _aggressive_busy_handler, <void *>n)
         return True
 
@@ -1451,8 +1483,8 @@ cdef void _rollback_callback(void *userData) with gil:
     fn()
 
 
-cdef void _update_callback(void *userData, int queryType, char *database,
-                            char *table, sqlite3_int64 rowid) with gil:
+cdef void _update_callback(void *userData, int queryType, const char *database,
+                           const char *table, sqlite3_int64 rowid) with gil:
     # C-callback that delegates to a Python function that is executed whenever
     # the database is updated (insert/update/delete queries). The Python
     # callback receives a string indicating the query type, the name of the
@@ -1526,7 +1558,7 @@ cdef int _aggressive_busy_handler(void *ptr, int n) nogil:
     # ensure that this doesn't happen. Furthermore, this function makes more
     # attempts in the same time period than the default handler.
     cdef:
-        int busyTimeout = <int>ptr
+        sqlite3_int64 busyTimeout = <sqlite3_int64>ptr
         int current, total
 
     if n < 20:

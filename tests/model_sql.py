@@ -13,9 +13,17 @@ from .base import __sql__
 from .base_models import *
 
 
+class CKM(TestModel):
+    category = CharField()
+    key = CharField()
+    value = IntegerField()
+    class Meta:
+        primary_key = CompositeKey('category', 'key')
+
+
 class TestModelSQL(ModelDatabaseTestCase):
     database = get_in_memory_db()
-    requires = [Category, Note, Person, Relationship, User]
+    requires = [Category, CKM, Note, Person, Relationship, Sample, User]
 
     def test_select(self):
         query = (Person
@@ -107,6 +115,19 @@ class TestModelSQL(ModelDatabaseTestCase):
         self.assertSQL(query, (
             'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
             'ORDER BY "t1"."username" DESC, "t1"."id"'), [])
+
+    def test_paginate(self):
+        # Get the first page, default is limit of 20.
+        query = User.select().paginate(1)
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
+            'LIMIT ? OFFSET ?'), [20, 0])
+
+        # Page 3 contains rows 31-45.
+        query = User.select().paginate(3, 15)
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."username" FROM "users" AS "t1" '
+            'LIMIT ? OFFSET ?'), [15, 30])
 
     def test_subquery_correction(self):
         users = User.select().where(User.username.in_(['foo', 'bar']))
@@ -267,6 +288,74 @@ class TestModelSQL(ModelDatabaseTestCase):
             'CROSS JOIN "b" AS "t2" '
             'ORDER BY "t1"."id", "t2"."id"'), [])
 
+    def test_join_expr(self):
+        class User(TestModel):
+            username = TextField(primary_key=True)
+        class Tweet(TestModel):
+            user = ForeignKeyField(User, backref='tweets')
+            content = TextField()
+
+        sql = ('SELECT "t1"."id", "t1"."user_id", "t1"."content", '
+               '"t2"."username" FROM "tweet" AS "t1" '
+               'INNER JOIN "user" AS "t2" '
+               'ON ("t1"."user_id" = "t2"."username")')
+
+        query = Tweet.select(Tweet, User).join(User)
+        self.assertSQL(query, sql, [])
+
+        query = (Tweet
+                 .select(Tweet, User)
+                 .join(User, on=(Tweet.user == User.username)))
+        self.assertSQL(query, sql, [])
+
+        join_expr = ((Tweet.user == User.username) & (Value(1) == 1))
+        query = Tweet.select().join(User, on=join_expr)
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."user_id", "t1"."content" '
+            'FROM "tweet" AS "t1" '
+            'INNER JOIN "user" AS "t2" '
+            'ON (("t1"."user_id" = "t2"."username") AND (? = ?))'), [1, 1])
+
+    def test_join_multiple_fks(self):
+        class A(TestModel):
+            name = TextField()
+        class B(TestModel):
+            name = TextField(primary_key=True)
+            a1 = ForeignKeyField(A, backref='b_set1')
+            a2 = ForeignKeyField(A, field=A.name, backref='b_set2')
+
+        A1 = A.alias('a1')
+        A2 = A.alias('a2')
+
+        sql = ('SELECT "t1"."name", "t1"."a1_id", "t1"."a2_id", '
+               '"a1"."id", "a1"."name", "a2"."id", "a2"."name" '
+               'FROM "b" AS "t1" '
+               'INNER JOIN "a" AS "a1" ON ("t1"."a1_id" = "a1"."id") '
+               'INNER JOIN "a" AS "a2" ON ("t1"."a2_id" = "a2"."name")')
+
+        query = (B.select(B, A1, A2)
+                 .join_from(B, A1, on=B.a1)
+                 .join_from(B, A2, on=B.a2))
+        self.assertSQL(query, sql, [])
+
+        query = (B.select(B, A1, A2)
+                 .join(A1, on=(B.a1 == A1.id)).switch(B)
+                 .join(A2, on=(B.a2 == A2.name)))
+        self.assertSQL(query, sql, [])
+
+        jx1 = (B.a1 == A1.id) & (Value(1) == 1)
+        jx2 = (Value(1) == 1) & (B.a2 == A2.name)
+        query = (B.select()
+                 .join(A1, on=jx1).switch(B)
+                 .join(A2, on=jx2))
+        self.assertSQL(query, (
+            'SELECT "t1"."name", "t1"."a1_id", "t1"."a2_id" '
+            'FROM "b" AS "t1" '
+            'INNER JOIN "a" AS "a1" '
+            'ON (("t1"."a1_id" = "a1"."id") AND (? = ?)) '
+            'INNER JOIN "a" AS "a2" '
+            'ON ((? = ?) AND ("t1"."a2_id" = "a2"."name"))'), [1, 1, 1, 1])
+
     def test_raw(self):
         query = (Person
                  .raw('SELECT first, last, dob FROM person '
@@ -326,6 +415,19 @@ class TestModelSQL(ModelDatabaseTestCase):
             'VALUES (?, ?), (?, ?)'),
             [1, 'note-1', 2, 'note-2'])
 
+    def test_insert_many_defaults(self):
+        # Verify fields are inferred and values are read correctly, when
+        # partial data is given and a field has default values.
+        s2 = {'counter': 2, 'value': 2.}
+        s3 = {'counter': 3}
+        self.assertSQL(Sample.insert_many([s2, s3]), (
+            'INSERT INTO "sample" ("counter", "value") VALUES (?, ?), (?, ?)'),
+            [2, 2., 3, 1.])
+
+        self.assertSQL(Sample.insert_many([s3, s2]), (
+            'INSERT INTO "sample" ("counter", "value") VALUES (?, ?), (?, ?)'),
+            [3, 1., 2, 2.])
+
     def test_insert_many_list_with_fields(self):
         data = [(i,) for i in ('charlie', 'huey', 'zaizee')]
         query = User.insert_many(data, fields=[User.username])
@@ -338,6 +440,21 @@ class TestModelSQL(ModelDatabaseTestCase):
         self.assertSQL(query, (
             'INSERT INTO "users" ("username") VALUES (?), (?), (?)'),
             ['charlie', 'huey', 'zaizee'])
+
+    def test_insert_many_infer_fields(self):
+        data = [('f1', 'l1', '1980-01-01'),
+                ('f2', 'l2', '1980-02-02')]
+        self.assertSQL(Person.insert_many(data), (
+            'INSERT INTO "person" ("first", "last", "dob") '
+            'VALUES (?, ?, ?), (?, ?, ?)'),
+            ['f1', 'l1', datetime.date(1980, 1, 1),
+             'f2', 'l2', datetime.date(1980, 2, 2)])
+
+        # When primary key is not auto-increment, PKs are included.
+        data = [('c1', 'k1', 1), ('c2', 'k2', 2)]
+        self.assertSQL(CKM.insert_many(data), (
+            'INSERT INTO "ckm" ("category", "key", "value") '
+            'VALUES (?, ?, ?), (?, ?, ?)'), ['c1', 'k1', 1, 'c2', 'k2', 2])
 
     def test_insert_query(self):
         select = (Person
@@ -384,6 +501,142 @@ class TestModelSQL(ModelDatabaseTestCase):
         self.assertSQL(query, (
             'INSERT INTO "person" ("name") VALUES (?)'), ['huey'])
 
+        query = (Person
+                 .insert({Person.name: 'foo'})
+                 .returning(Person.ssn.alias('new_ssn')))
+        self.assertSQL(query, (
+            'INSERT INTO "person" ("name") VALUES (?) '
+            'RETURNING "person"."ssn" AS "new_ssn"'), ['foo'])
+
+    def test_insert_get_field_values(self):
+        class User(TestModel):
+            username = TextField(primary_key=True)
+            class Meta:
+                database = self.database
+
+        class Tweet(TestModel):
+            user = ForeignKeyField(User)
+            content = TextField()
+            class Meta:
+                database = self.database
+
+        queries = (
+            User.insert(username='a'),
+            User.insert({'username': 'a'}),
+            User.insert({User.username: 'a'}))
+        for query in queries:
+            self.assertSQL(query, ('INSERT INTO "user" ("username") '
+                                   'VALUES (?)'), ['a'])
+
+        # Verify that we can provide all kinds of combinations to the
+        # constructor to INSERT and it will map the parameters correctly
+        # without losing values.
+        a = User(username='a')
+        queries = (
+            Tweet.insert(user=a, content='ca'),
+            Tweet.insert({'user': a, 'content': 'ca'}),
+            Tweet.insert({Tweet.user: a, 'content': 'ca'}),
+            Tweet.insert({'user': a, Tweet.content: 'ca'}),
+            Tweet.insert({Tweet.user: a, Tweet.content: 'ca'}),
+            Tweet.insert({Tweet.user: a}, content='ca'),
+            Tweet.insert({Tweet.content: 'ca'}, user=a),
+            Tweet.insert({'user': a}, content='ca'),
+            Tweet.insert({'content': 'ca'}, user=a),
+
+            # Also test using the foreign-key descriptor and column name.
+            Tweet.insert({Tweet.user_id: a, Tweet.content: 'ca'}),
+            Tweet.insert(user_id=a, content='ca'),
+            Tweet.insert({'user_id': a, 'content': 'ca'}))
+
+        for query in queries:
+            self.assertSQL(query, ('INSERT INTO "tweet" ("user_id", "content")'
+                                   ' VALUES (?, ?)'), ['a', 'ca'])
+
+    def test_insert_many_get_field_values(self):
+        class User(TestModel):
+            username = TextField(primary_key=True)
+            class Meta:
+                database = self.database
+
+        class Tweet(TestModel):
+            user = ForeignKeyField(User)
+            content = TextField()
+            class Meta:
+                database = self.database
+
+        # Ensure we can handle any combination of insert-data key and field
+        # list value.
+        pairs = ((User.username, 'username'),
+                 ('username', User.username),
+                 ('username', 'username'),
+                 (User.username, User.username))
+
+        for dict_key, fields_key in pairs:
+            iq = User.insert_many([{dict_key: u} for u in 'abc'],
+                                  fields=[fields_key])
+            self.assertSQL(iq, (
+                'INSERT INTO "user" ("username") VALUES (?), (?), (?)'),
+                ['a', 'b', 'c'])
+
+        a, b = User(username='a'), User(username='b')
+        user_content = (
+            (a, 'ca1'),
+            (a, 'ca2'),
+            (b, 'cb1'),
+            ('a', 'ca3'))  # Specify user id directly.
+
+        # Ensure we can mix-and-match key type within insert-data.
+        pairs = (('user', 'content'),
+                 (Tweet.user, Tweet.content),
+                 (Tweet.user, 'content'),
+                 ('user', Tweet.content),
+                 ('user_id', 'content'),
+                 (Tweet.user_id, Tweet.content))
+
+        for ukey, ckey in pairs:
+            iq = Tweet.insert_many([{ukey: u, ckey: c}
+                                    for u, c in user_content])
+            self.assertSQL(iq, (
+                'INSERT INTO "tweet" ("user_id", "content") VALUES '
+                '(?, ?), (?, ?), (?, ?), (?, ?)'),
+                ['a', 'ca1', 'a', 'ca2', 'b', 'cb1', 'a', 'ca3'])
+
+    def test_insert_many_dict_and_list(self):
+        class R(TestModel):
+            k = TextField(column_name='key')
+            v = IntegerField(column_name='value', default=0)
+            class Meta:
+                database = self.database
+
+        data = (
+            {'k': 'k1', 'v': 1},
+            {R.k: 'k2', R.v: 2},
+            {'key': 'k3', 'value': 3},
+            ('k4', 4),
+            ('k5', '5'),  # Will be converted properly.
+            {R.k: 'k6', R.v: '6'},
+            {'key': 'k7', 'value': '7'},
+            {'k': 'kx'},
+            ('ky',))
+
+        param_str = ', '.join('(?, ?)' for _ in range(len(data)))
+        queries = (
+            R.insert_many(data),
+            R.insert_many(data, fields=[R.k, R.v]),
+            R.insert_many(data, fields=['k', 'v']))
+        for query in queries:
+            self.assertSQL(query, (
+                'INSERT INTO "r" ("key", "value") VALUES %s' % param_str),
+                ['k1', 1, 'k2', 2, 'k3', 3, 'k4', 4, 'k5', 5, 'k6', 6,
+                 'k7', 7, 'kx', 0, 'ky', 0])
+
+    def test_insert_modelalias(self):
+        UA = User.alias('ua')
+        self.assertSQL(UA.insert({UA.username: 'huey'}), (
+            'INSERT INTO "users" ("username") VALUES (?)'), ['huey'])
+        self.assertSQL(UA.insert(username='huey'), (
+            'INSERT INTO "users" ("username") VALUES (?)'), ['huey'])
+
     def test_update(self):
         class Stat(TestModel):
             url = TextField()
@@ -407,6 +660,31 @@ class TestModelSQL(ModelDatabaseTestCase):
             'UPDATE "stat" SET "count" = ("stat"."count" + ?) '
             'WHERE ("stat"."url" = ?)'),
             [1, '/peewee'])
+
+    def test_update_subquery(self):
+        class U(TestModel):
+            username = TextField()
+            flood_count = IntegerField()
+
+        class T(TestModel):
+            user = ForeignKeyField(U)
+
+        ctq = T.select(fn.COUNT(T.id) / 100).where(T.user == U.id)
+        subq = (T
+                .select(T.user)
+                .group_by(T.user)
+                .having(fn.COUNT(T.id) > 100))
+        query = (U
+                 .update({U.flood_count: ctq})
+                 .where(U.id.in_(subq)))
+        self.assertSQL(query, (
+            'UPDATE "u" SET "flood_count" = ('
+            'SELECT (COUNT("t1"."id") / ?) FROM "t" AS "t1" '
+            'WHERE ("t1"."user_id" = "u"."id")) '
+            'WHERE ("u"."id" IN ('
+            'SELECT "t1"."user_id" FROM "t" AS "t1" '
+            'GROUP BY "t1"."user_id" '
+            'HAVING (COUNT("t1"."id") > ?)))'), [100, 100])
 
     def test_update_from(self):
         class SalesPerson(TestModel):

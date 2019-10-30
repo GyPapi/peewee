@@ -202,6 +202,11 @@ Registering user-defined functions:
     # particular group or groups, you can:
     register_aggregate_groups(db, 'DATE')
 
+    # If you only wish to register a single function, then you can:
+    from playhouse.sqlite_udf import gzip, gunzip
+    db.register_function(gzip, 'gzip')
+    db.register_function(gunzip, 'gunzip')
+
 Using a library function ("hostname"):
 
 .. code-block:: python
@@ -1030,6 +1035,9 @@ dedicated column for storing ``tsvector`` data:
         content = TextField()
         search_content = TSVectorField()
 
+.. note::
+    :py:class:`TSVectorField`, will automatically be created with a GIN index.
+
 You will need to explicitly convert the incoming text data to ``tsvector`` when
 inserting or updating the ``search_content`` field:
 
@@ -1040,7 +1048,14 @@ inserting or updating the ``search_content`` field:
         content=content,
         search_content=fn.to_tsvector(content))
 
-.. note:: If you are using the :py:class:`TSVectorField`, it will automatically be created with a GIN index.
+To perform a full-text search, use :py:meth:`TSVectorField.match`:
+
+.. code-block:: python
+
+    terms = 'python & (sqlite | postgres)'
+    results = Blog.select().where(Blog.search_content.match(terms))
+
+For more information, see the `Postgres full-text search docs <https://www.postgresql.org/docs/current/textsearch.html>`_.
 
 
 postgres_ext API notes
@@ -1556,6 +1571,21 @@ postgres_ext API notes
               content=content,
               search_content=fn.to_tsvector(content))  # Note `to_tsvector()`.
 
+    .. py:method:: match(query[, language=None[, plain=False]])
+
+        :param str query: the full-text search query.
+        :param str language: language name (optional).
+        :param bool plain: parse search query using plain (simple) parser.
+        :returns: an expression representing full-text search/match.
+
+        Example:
+
+        .. code-block:: python
+
+            # Perform a search using the "match" method.
+            terms = 'python & (sqlite | postgres)'
+            results = Blog.select().where(Blog.search_content.match(terms))
+
 
 .. _mysql_ext:
 
@@ -1574,6 +1604,25 @@ Example usage:
 
     # MySQL database implementation that utilizes mysql-connector driver.
     db = MySQLConnectorDatabase('my_database', host='1.2.3.4', user='mysql')
+
+Additional MySQL-specific helpers:
+
+.. py:class:: JSONField()
+
+    Extends :py:class:`TextField` and implements transparent JSON encoding and
+    decoding in Python.
+
+.. py:function:: Match(columns, expr[, modifier=None])
+
+    :param columns: a single :py:class:`Field` or a tuple of multiple fields.
+    :param str expr: the full-text search expression.
+    :param str modifier: optional modifiers for the search, e.g. *'in boolean mode'*.
+
+    Helper class for constructing MySQL full-text search queries of the form:
+
+    .. code-block:: sql
+
+        MATCH (columns, ...) AGAINST (expr[ modifier])
 
 .. _dataset:
 
@@ -1601,13 +1650,33 @@ A minimal data-loading script might look like this:
     table.insert(name='Mickey', age=5, gender='male')
 
     huey = table.find_one(name='Huey')
-    print huey
+    print(huey)
     # {'age': 3, 'gender': None, 'id': 1, 'name': 'Huey'}
 
     for obj in table:
-        print obj
+        print(obj)
     # {'age': 3, 'gender': None, 'id': 1, 'name': 'Huey'}
     # {'age': 5, 'gender': 'male', 'id': 2, 'name': 'Mickey'}
+
+You can insert, update or delete using the dictionary APIs as well:
+
+.. code-block:: python
+
+    huey = table.find_one(name='Huey')
+    # {'age': 3, 'gender': None, 'id': 1, 'name': 'Huey'}
+
+    # Perform an update by supplying a partial record of changes.
+    table[1] = {'gender': 'male', 'age': 4}
+    print(table[1])
+    # {'age': 4, 'gender': 'male', 'id': 1, 'name': 'Huey'}
+
+    # Or insert a new record:
+    table[3] = {'name': 'Zaizee', 'age': 2}
+    print(table[3])
+    # {'age': 2, 'gender': None, 'id': 3, 'name': 'Zaizee'}
+
+    # Or delete a record:
+    del table[3]  # Remove the row we just added.
 
 You can export or import data using :py:meth:`~DataSet.freeze` and
 :py:meth:`~DataSet.thaw`:
@@ -1829,6 +1898,8 @@ API
         Close the connection to the underlying database.
 
 .. py:class:: Table(dataset, name, model_class)
+
+    :noindex:
 
     Provides a high-level API for working with rows in a given table.
 
@@ -2883,6 +2954,15 @@ Making a field nullable or not nullable:
         migrator.add_not_null('story', 'modified_date'),
     )
 
+Altering a field's data-type:
+
+.. code-block:: python
+
+    # Change a VARCHAR(50) field to a TEXT field.
+    migrate(
+        migrator.alter_column_type('person', 'email', TextField())
+    )
+
 Renaming a table:
 
 .. code-block:: python
@@ -2993,6 +3073,19 @@ Migrations API
         :param str table: Name of table containing column.
         :param str column: Name of the column to make nullable.
 
+    .. py:method:: alter_column_type(table, column, field[, cast=None])
+
+        :param str table: Name of the table.
+        :param str column_name: Name of the column to modify.
+        :param Field field: :py:class:`Field` instance representing new
+            data type.
+        :param cast: (postgres-only) specify a cast expression if the
+            data-types are incompatible, e.g. ``column_name::int``. Can be
+            provided as either a string or a :py:class:`Cast` instance.
+
+        Alter the data-type of a column. This method should be used with care,
+        as using incompatible types may not be well-supported by your database.
+
     .. py:method:: rename_table(old_name, new_name)
 
         :param str old_name: Current name of the table.
@@ -3072,6 +3165,25 @@ including :ref:`dataset` and :ref:`pwiz`.
     Generate models for the tables in the given database. For an example of how
     to use this function, see the section :ref:`interactive`.
 
+    Example:
+
+    .. code-block:: pycon
+
+        >>> from peewee import *
+        >>> from playhouse.reflection import generate_models
+        >>> db = PostgresqlDatabase('my_app')
+        >>> models = generate_models(db)
+        >>> list(models.keys())
+        ['account', 'customer', 'order', 'orderitem', 'product']
+
+        >>> globals().update(models)  # Inject models into namespace.
+        >>> for cust in customer.select():  # Query using generated model.
+        ...     print(cust.name)
+        ...
+
+        Huey Kitty
+        Mickey Dog
+
 .. py:function:: print_model(model)
 
     :param Model model: model class to print
@@ -3081,6 +3193,34 @@ including :ref:`dataset` and :ref:`pwiz`.
     interactive use. Currently this prints the table name, and all fields along
     with their data-types. The :ref:`interactive` section contains an example.
 
+    Example output:
+
+    .. code-block:: pycon
+
+        >>> from playhouse.reflection import print_model
+        >>> print_model(User)
+        user
+          id AUTO PK
+          email TEXT
+          name TEXT
+          dob DATE
+
+        index(es)
+          email UNIQUE
+
+        >>> print_model(Tweet)
+        tweet
+          id AUTO PK
+          user INT FK: User.id
+          title TEXT
+          content TEXT
+          timestamp DATETIME
+          is_published BOOL
+
+        index(es)
+          user_id
+          is_published, timestamp
+
 .. py:function:: print_table_sql(model)
 
     :param Model model: model to print
@@ -3088,7 +3228,32 @@ including :ref:`dataset` and :ref:`pwiz`.
 
     Prints the SQL ``CREATE TABLE`` for the given model class, which may be
     useful for debugging or interactive use. See the :ref:`interactive` section
-    for example usage.
+    for example usage. Note that indexes and constraints are not included in
+    the output of this function.
+
+    Example output:
+
+    .. code-block:: pycon
+
+        >>> from playhouse.reflection import print_table_sql
+        >>> print_table_sql(User)
+        CREATE TABLE IF NOT EXISTS "user" (
+          "id" INTEGER NOT NULL PRIMARY KEY,
+          "email" TEXT NOT NULL,
+          "name" TEXT NOT NULL,
+          "dob" DATE NOT NULL
+        )
+
+        >>> print_table_sql(Tweet)
+        CREATE TABLE IF NOT EXISTS "tweet" (
+          "id" INTEGER NOT NULL PRIMARY KEY,
+          "user_id" INTEGER NOT NULL,
+          "title" TEXT NOT NULL,
+          "content" TEXT NOT NULL,
+          "timestamp" DATETIME NOT NULL,
+          "is_published" INTEGER NOT NULL,
+          FOREIGN KEY ("user_id") REFERENCES "user" ("id")
+        )
 
 .. py:class:: Introspector(metadata[, schema=None])
 

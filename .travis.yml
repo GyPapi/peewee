@@ -33,7 +33,6 @@ matrix:
         - sudo ldconfig
       script: "python runtests.py -v2"
   allow_failures:
-    - python: 3.8-dev
 addons:
   postgresql: "9.6"
   mariadb: "10.3"
@@ -46,7 +45,9 @@ before_script:
   - psql -c 'drop database if exists peewee_test;' -U postgres
   - psql -c 'create database peewee_test;' -U postgres
   - psql peewee_test -c 'create extension hstore;' -U postgres
+  - mysql -e 'drop user if exists travis@localhost;'
+  - mysql -e 'create user travis@localhost;'
   - mysql -e 'drop database if exists peewee_test;'
   - mysql -e 'create database peewee_test;'
-  - mysql -e 'grant all on *.* to travis@localhost;'
+  - mysql -e 'grant all on *.* to travis@localhost;' || true
 script: "python runtests.py"

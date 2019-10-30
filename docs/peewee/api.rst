@@ -8,7 +8,7 @@ This document specifies Peewee's APIs.
 Database
 --------
 
-.. py:class:: Database(database[, thread_safe=True[, autorollback=False[, field_types=None[, operations=None[, **kwargs]]]]])
+.. py:class:: Database(database[, thread_safe=True[, autorollback=False[, field_types=None[, operations=None[, autoconnect=True[, **kwargs]]]]]])
 
     :param str database: Database name or filename for SQLite (or ``None`` to
         :ref:`defer initialization <deferring_initialization>`, in which case
@@ -19,6 +19,8 @@ Database
         **not** in an explicit transaction.
     :param dict field_types: A mapping of additional field types to support.
     :param dict operations: A mapping of additional operations to support.
+    :param bool autoconnect: Automatically connect to database if attempting to
+        execute a query on a closed database.
     :param kwargs: Arbitrary keyword arguments that will be passed to the
         database driver when a connection is created, for example ``password``,
         ``host``, etc.
@@ -241,6 +243,39 @@ Database
 
             with db.atomic():
                 user.delete_instance(recursive=True)
+
+    .. py:method:: session_start()
+
+        Begin a new transaction (without using a context-manager or decorator).
+        This method is useful if you intend to execute a sequence of operations
+        inside a transaction, but using a decorator or context-manager would
+        not be appropriate.
+
+        .. note::
+            It is strongly advised that you use the :py:meth:`Database.atomic`
+            method whenever possible for managing transactions/savepoints. The
+            ``atomic`` method correctly manages nesting, uses the appropriate
+            construction (e.g., transaction-vs-savepoint), and always cleans up
+            after itself.
+
+            The :py:meth:`~Database.session_start` method should only be used
+            if the sequence of operations does not easily lend itself to
+            wrapping using either a context-manager or decorator.
+
+        .. warning::
+            You must *always* call either :py:meth:`~Database.session_commit`
+            or :py:meth:`~Database.session_rollback` after calling the
+            ``session_start`` method.
+
+    .. py:method:: session_commit()
+
+        Commit any changes made during a transaction begun with
+        :py:meth:`~Database.session_start`.
+
+    .. py:method:: session_rollback()
+
+        Roll back any changes made during a transaction begun with
+        :py:meth:`~Database.session_start`.
 
     .. py:method:: transaction()
 
@@ -498,6 +533,36 @@ Database
                 def test_something(self):
                     # ... models are bound to test database ...
                     pass
+
+    .. py:method:: extract_date(date_part, date_field)
+
+        :param str date_part: date part to extract, e.g. 'year'.
+        :param Node date_field: a SQL node containing a date/time, for example
+            a :py:class:`DateTimeField`.
+        :returns: a SQL node representing a function call that will return the
+            provided date part.
+
+        Provides a compatible interface for extracting a portion of a datetime.
+
+    .. py:method:: truncate_date(date_part, date_field)
+
+        :param str date_part: date part to truncate to, e.g. 'day'.
+        :param Node date_field: a SQL node containing a date/time, for example
+            a :py:class:`DateTimeField`.
+        :returns: a SQL node representing a function call that will return the
+            truncated date part.
+
+        Provides a compatible interface for truncating a datetime to the given
+        resolution.
+
+    .. py:method:: random()
+
+        :returns: a SQL node representing a function call that returns a random
+            value.
+
+        A compatible interface for calling the appropriate random number
+        generation function provided by the database. For Postgres and Sqlite,
+        this is equivalent to ``fn.random()``, for MySQL ``fn.rand()``.
 
 
 .. py:class:: SqliteDatabase(database[, pragmas=None[, timeout=5[, **kwargs]]])
@@ -873,7 +938,7 @@ Database
         strategy (defaults to DEFERRED).
 
 
-.. py:class:: PostgresqlDatabase(database[, register_unicode=True[, encoding=None]])
+.. py:class:: PostgresqlDatabase(database[, register_unicode=True[, encoding=None[, isolation_level=None]]])
 
     Postgresql database implementation.
 
@@ -881,6 +946,16 @@ Database
 
     :param bool register_unicode: Register unicode types.
     :param str encoding: Database encoding.
+    :param int isolation_level: Isolation level constant, defined in the
+        ``psycopg2.extensions`` module.
+
+    .. py:method:: set_time_zone(timezone)
+
+        :param str timezone: timezone name, e.g. "US/Central".
+        :returns: no return value.
+
+        Set the timezone on the current connection. If no connection is open,
+        then one will be opened.
 
 
 .. py:class:: MySQLDatabase(database[, **kwargs])
@@ -1246,12 +1321,16 @@ Query-builder
 
         Create a ``CAST`` expression.
 
-    .. py:method:: asc()
+    .. py:method:: asc([collation=None[, nulls=None]])
 
+        :param str collation: Collation name to use for sorting.
+        :param str nulls: Sort nulls (FIRST or LAST).
         :returns: an ascending :py:class:`Ordering` object for the column.
 
-    .. py:method:: desc()
+    .. py:method:: desc([collation=None[, nulls=None]])
 
+        :param str collation: Collation name to use for sorting.
+        :param str nulls: Sort nulls (FIRST or LAST).
         :returns: an descending :py:class:`Ordering` object for the column.
 
     .. py:method:: __invert__()
@@ -1325,6 +1404,10 @@ Query-builder
     :param str nulls: Sort nulls (FIRST or LAST).
 
     Represent ordering by a column-like object.
+
+    Postgresql supports a non-standard clause ("NULLS FIRST/LAST"). Peewee will
+    automatically use an equivalent ``CASE`` statement for databases that do
+    not support this (Sqlite / MySQL).
 
     .. py:method:: collate([collation=None])
 
@@ -1402,7 +1485,7 @@ Query-builder
                  .group_by(User.username)
                  .order_by(fn.COUNT(Tweet.id).desc()))
 
-    .. py:method:: over([partition_by=None[, order_by=None[, start=None[, end=None[, window=None]]]]])
+    .. py:method:: over([partition_by=None[, order_by=None[, start=None[, end=None[, window=None[, exclude=None]]]]]])
 
         :param list partition_by: List of columns to partition by.
         :param list order_by: List of columns / expressions to order window by.
@@ -1410,8 +1493,11 @@ Query-builder
             start of the window range.
         :param end: A :py:class:`SQL` instance or a string expressing the
             end of the window range.
-        :param str frame_type: ``Window.RANGE`` or ``Window.ROWS``.
+        :param str frame_type: ``Window.RANGE``, ``Window.ROWS`` or
+            ``Window.GROUPS``.
         :param Window window: A :py:class:`Window` instance.
+        :param exclude: Frame exclusion, one of ``Window.CURRENT_ROW``,
+            ``Window.GROUP``, ``Window.TIES`` or ``Window.NO_OTHERS``.
 
         .. note::
             For an in-depth guide to using window functions with Peewee,
@@ -1525,7 +1611,7 @@ Query-builder
         # Get users whose username begins with "A" or "a":
         a_users = User.select().where(fn.LOWER(fn.SUBSTR(User.username, 1, 1)) == 'a')
 
-.. py:class:: Window([partition_by=None[, order_by=None[, start=None[, end=None[, frame_type=None[, alias=None]]]]]])
+.. py:class:: Window([partition_by=None[, order_by=None[, start=None[, end=None[, frame_type=None[, extends=None[, exclude=None[, alias=None]]]]]]]])
 
     :param list partition_by: List of columns to partition by.
     :param list order_by: List of columns to order by.
@@ -1533,7 +1619,12 @@ Query-builder
         of the window range.
     :param end: A :py:class:`SQL` instance or a string expressing the end of
         the window range.
-    :param str frame_type: ``Window.RANGE`` or ``Window.ROWS``.
+    :param str frame_type: ``Window.RANGE``, ``Window.ROWS`` or
+        ``Window.GROUPS``.
+    :param extends: A :py:class:`Window` definition to extend. Alternately, you
+        may specify the window's alias instead.
+    :param exclude: Frame exclusion, one of ``Window.CURRENT_ROW``,
+        ``Window.GROUP``, ``Window.TIES`` or ``Window.NO_OTHERS``.
     :param str alias: Alias for the window.
 
     Represent a WINDOW clause.
@@ -1542,19 +1633,22 @@ Query-builder
         For an in-depth guide to using window functions with Peewee,
         see the :ref:`window-functions` section.
 
+    .. py:attribute:: RANGE
+    .. py:attribute:: ROWS
+    .. py:attribute:: GROUPS
+
+        Specify the window ``frame_type``. See :ref:`window-frame-types`.
+
     .. py:attribute:: CURRENT_ROW
 
-        Reference to current row for use in start/end clause.
+        Reference to current row for use in start/end clause or the frame
+        exclusion parameter.
 
-    .. py:attribute:: RANGE
+    .. py:attribute:: NO_OTHERS
+    .. py:attribute:: GROUP
+    .. py:attribute:: TIES
 
-        Specify the use of *RANGE* for the window ``frame_type``. For more
-        information, see :ref:`window-frame-types`.
-
-    .. py:attribute:: ROWS
-
-        Specify the use of *ROWS* for the window ``frame_type``. For more
-        information, see :ref:`window-frame-types`.
+        Specify the window frame exclusion parameter.
 
     .. py:staticmethod:: preceding([value=None])
 
@@ -1569,6 +1663,22 @@ Query-builder
 
         Convenience method for generating SQL suitable for passing in as the
         ``end`` parameter for a window range.
+
+    .. py:method:: as_rows()
+    .. py:method:: as_range()
+    .. py:method:: as_groups()
+
+        Specify the frame type.
+
+    .. py:method:: extends([window=None])
+
+        :param Window window: A :py:class:`Window` definition to extend.
+            Alternately, you may specify the window's alias instead.
+
+    .. py:method:: exclude([frame_exclusion=None])
+
+        :param frame_exclusion: Frame exclusion, one of ``Window.CURRENT_ROW``,
+            ``Window.GROUP``, ``Window.TIES`` or ``Window.NO_OTHERS``.
 
     .. py:method:: alias([alias=None])
 
@@ -1661,7 +1771,7 @@ Query-builder
 
     :param str action: Action to take when resolving conflict.
     :param update: A dictionary mapping column to new value.
-    :param preserve: A list of columns whose values should be preserved from the original INSERT.
+    :param preserve: A list of columns whose values should be preserved from the original INSERT. See also :py:class:`EXCLUDED`.
     :param where: Expression to restrict the conflict resolution.
     :param conflict_target: Column(s) that comprise the constraint.
     :param conflict_where: Expressions needed to match the constraint target if it is a partial index (index with a WHERE clause).
@@ -1703,6 +1813,44 @@ Query-builder
 
         :param str constraint: Name of constraints to use as target for
             conflict resolution. Currently only supported by Postgres.
+
+
+.. py:class:: EXCLUDED
+
+    Helper object that exposes the ``EXCLUDED`` namespace that is used with
+    ``INSERT ... ON CONFLICT`` to reference values in the conflicting data.
+    This is a "magic" helper, such that one uses it by accessing attributes on
+    it that correspond to a particular column.
+
+    Example:
+
+    .. code-block:: python
+
+        class KV(Model):
+            key = CharField(unique=True)
+            value = IntegerField()
+
+        # Create one row.
+        KV.create(key='k1', value=1)
+
+        # Demonstrate usage of EXCLUDED.
+        # Here we will attempt to insert a new value for a given key. If that
+        # key already exists, then we will update its value with the *sum* of its
+        # original value and the value we attempted to insert -- provided that
+        # the new value is larger than the original value.
+        query = (KV.insert(key='k1', value=10)
+                 .on_conflict(conflict_target=[KV.key],
+                              update={KV.value: KV.value + EXCLUDED.value},
+                              where=(EXCLUDED.value > KV.value)))
+
+        # Executing the above query will result in the following data being
+        # present in the "kv" table:
+        # (key='k1', value=11)
+        query.execute()
+
+        # If we attempted to execute the query *again*, then nothing would be
+        # updated, as the new value (10) is now less than the value in the
+        # original row (11).
 
 
 .. py:class:: BaseQuery()
@@ -2412,7 +2560,7 @@ Query-builder
 
     .. py:method:: on_conflict_replace([replace=True])
 
-        :param bool ignore: Whether to add ON CONFLICT REPLACE clause.
+        :param bool replace: Whether to add ON CONFLICT REPLACE clause.
 
         Specify REPLACE conflict resolution strategy.
 
@@ -2431,7 +2579,7 @@ Query-builder
         Specify the parameters for an :py:class:`OnConflict` clause to use for
         conflict resolution.
 
-        Example:
+        Examples:
 
         .. code-block:: python
 
@@ -2455,6 +2603,36 @@ Query-builder
                               update={User.login_count: User.login_count + 1})
                           .execute())
                 return userid
+
+        Example using the special :py:class:`EXCLUDED` namespace:
+
+        .. code-block:: python
+
+            class KV(Model):
+                key = CharField(unique=True)
+                value = IntegerField()
+
+            # Create one row.
+            KV.create(key='k1', value=1)
+
+            # Demonstrate usage of EXCLUDED.
+            # Here we will attempt to insert a new value for a given key. If that
+            # key already exists, then we will update its value with the *sum* of its
+            # original value and the value we attempted to insert -- provided that
+            # the new value is larger than the original value.
+            query = (KV.insert(key='k1', value=10)
+                     .on_conflict(conflict_target=[KV.key],
+                                  update={KV.value: KV.value + EXCLUDED.value},
+                                  where=(EXCLUDED.value > KV.value)))
+
+            # Executing the above query will result in the following data being
+            # present in the "kv" table:
+            # (key='k1', value=11)
+            query.execute()
+
+            # If we attempted to execute the query *again*, then nothing would be
+            # updated, as the new value (10) is now less than the value in the
+            # original row (11).
 
 
 .. py:class:: Delete()
@@ -2639,7 +2817,12 @@ Fields
 
     Field class for storing auto-incrementing primary keys using 64-bits.
 
-.. py:class:: IdentityField
+.. py:class:: IdentityField([generate_always=False])
+
+    :param bool generate_always: if specified, then the identity will always be
+        generated (and specifying the value explicitly during INSERT will raise
+        a programming error). Otherwise, the identity value is only generated
+        as-needed.
 
     Field class for storing auto-incrementing primary keys using the new
     Postgres 10 *IDENTITY* column type. The column definition ends up looking
@@ -2875,6 +3058,32 @@ Fields
 
         Reference the second of the value stored in the column in a query.
 
+    .. py:method:: to_timestamp()
+
+        Method that returns a database-specific function call that will allow
+        you to work with the given date-time value as a numeric timestamp. This
+        can sometimes simplify tasks like date math in a compatible way.
+
+        Example:
+
+        .. code-block:: python
+
+            # Find all events that are exactly 1 hour long.
+            query = (Event
+                     .select()
+                     .where((Event.start.to_timestamp() + 3600) ==
+                            Event.stop.to_timestamp())
+                     .order_by(Event.start))
+
+    .. py:method:: truncate(date_part)
+
+        :param str date_part: year, month, day, hour, minute or second.
+        :returns: expression node to truncate date/time to given resolution.
+
+        Truncates the value in the column to the given part. This method is
+        useful for finding all rows within a given month, for instance.
+
+
 .. py:class:: DateField([formats=None[, **kwargs]])
 
     :param list formats: A list of format strings to use when coercing a string
@@ -2910,6 +3119,16 @@ Fields
     .. py:attribute:: day
 
         Reference the day of the value stored in the column in a query.
+
+    .. py:method:: to_timestamp()
+
+        See :py:meth:`DateTimeField.to_timestamp`.
+
+    .. py:method:: truncate(date_part)
+
+        See :py:meth:`DateTimeField.truncate`. Note that only *year*, *month*,
+        and *day* are meaningful for :py:class:`DateField`.
+
 
 .. py:class:: TimeField([formats=None[, **kwargs]])
 
@@ -2951,15 +3170,24 @@ Fields
 
 .. py:class:: TimestampField([resolution=1[, utc=False[, **kwargs]]])
 
-    :param resolution: A power of 10, 1=second, 1000=ms, 1000000=us, etc.
+    :param resolution: Can be provided as either a power of 10, or as an
+        exponent indicating how many decimal places to store.
     :param bool utc: Treat timestamps as UTC.
 
     Field class for storing date-times as integer timestamps. Sub-second
     resolution is supported by multiplying by a power of 10 to get an integer.
 
-    Accepts a special parameter ``resolution``, which is a power-of-10 up to
-    ``10^6``. This allows sub-second precision while still using an
-    :py:class:`IntegerField` for storage. Default is ``1`` (second precision).
+    If the ``resolution`` parameter is ``0`` *or* ``1``, then the timestamp is
+    stored using second resolution. A resolution between ``2`` and ``6`` is
+    treated as the number of decimal places, e.g. ``resolution=3`` corresponds
+    to milliseconds. Alternatively, the decimal can be provided as a multiple
+    of 10, such that ``resolution=10`` will store 1/10th of a second
+    resolution.
+
+    The ``resolution`` parameter can be either 0-6 *or* 10, 100, etc up to
+    1000000 (for microsecond resolution). This allows sub-second precision
+    while still using an :py:class:`IntegerField` for storage. The default is
+    second resolution.
 
     Also accepts a boolean parameter ``utc``, used to indicate whether the
     timestamps should be UTC. Default is ``False``.
@@ -2990,7 +3218,7 @@ Fields
     Accepts a special ``coerce`` parameter, a function that takes a value
     coming from the database and converts it into the appropriate Python type.
 
-.. py:class:: ForeignKeyField(model[, field=None[, backref=None[, on_delete=None[, on_update=None[, deferrable=None[, object_id_name=None[, **kwargs]]]]]]])
+.. py:class:: ForeignKeyField(model[, field=None[, backref=None[, on_delete=None[, on_update=None[, deferrable=None[, object_id_name=None[, lazy_load=True[, **kwargs]]]]]]]])
 
     :param Model model: Model to reference or the string 'self' if declaring a
         self-referential foreign key.
@@ -3002,6 +3230,10 @@ Fields
     :param str on_update: ON UPDATE action.
     :param str deferrable: Control when constraint is enforced, e.g. ``'INITIALLY DEFERRED'``.
     :param str object_id_name: Name for object-id accessor.
+    :param bool lazy_load: Fetch the related object when the foreign-key field
+        attribute is accessed (if it was not already loaded). If this is
+        disabled, accessing the foreign-key field will return the value stored
+        in the foreign-key column.
 
     Field class for storing a foreign key.
 
@@ -3067,6 +3299,33 @@ Fields
     In the above example, when the ``Wife`` model is declared, the foreign-key
     ``Husband.wife`` is automatically resolved and turned into a regular
     :py:class:`ForeignKeyField`.
+
+    .. warning::
+        :py:class:`DeferredForeignKey` references are resolved when model
+        classes are declared and created. This means that if you declare a
+        :py:class:`DeferredForeignKey` to a model class that has already been
+        imported and created, the deferred foreign key instance will never be
+        resolved. For example:
+
+        .. code-block:: python
+
+            class User(Model):
+                username = TextField()
+
+            class Tweet(Model):
+                # This will never actually be resolved, because the User
+                # model has already been declared.
+                user = DeferredForeignKey('user', backref='tweets')
+                content = TextField()
+
+        In cases like these you should use the regular
+        :py:class:`ForeignKeyField` *or* you can manually resolve deferred
+        foreign keys like so:
+
+        .. code-block:: python
+
+            # Tweet.user will be resolved into a ForeignKeyField:
+            DeferredForeignKey.resolve(User)
 
 .. py:class:: ManyToManyField(model[, backref=None[, through_model=None[, on_delete=None[, on_update=None]]]])
 
@@ -3384,6 +3643,15 @@ Schema Manager
 
         Execute DROP TABLE query for the given model.
 
+    .. py:method:: truncate_table([restart_identity=False[, cascade=False]])
+
+        :param bool restart_identity: Restart the id sequence (postgres-only).
+        :param bool cascade: Truncate related tables as well (postgres-only).
+
+        Execute TRUNCATE TABLE for the given model. If the database is Sqlite,
+        which does not support TRUNCATE, then an equivalent DELETE query will
+        be executed.
+
     .. py:method:: create_indexes([safe=True])
 
         :param bool safe: Specify IF NOT EXISTS clause.
@@ -3498,6 +3766,27 @@ Model
 
         Traverse the model graph and return a list of 3-tuples, consisting of
         ``(foreign key field, model class, is_backref)``.
+
+    .. py:method:: set_database(database)
+
+        :param Database database: database object to bind Model to.
+
+        Bind the model class to the given :py:class:`Database` instance.
+
+        .. warning::
+            This API should not need to be used. Instead, to change a
+            :py:class:`Model` database at run-time, use one of the following:
+
+            * :py:meth:`Model.bind`
+            * :py:meth:`Model.bind_ctx` (bind for scope of a context manager).
+            * :py:meth:`Database.bind`
+            * :py:meth:`Database.bind_ctx`
+
+    .. py:method:: set_table_name(table_name)
+
+        :param str table_name: table name to bind Model to.
+
+        Bind the model class to the given table name at run-time.
 
 
 .. py:class:: SubclassAwareMetadata
@@ -3677,6 +3966,7 @@ Model
 
         :param rows: An iterable that yields rows to insert.
         :param list fields: List of fields being inserted.
+        :return: number of rows modified (see note).
 
         INSERT multiple rows of data.
 
@@ -3746,10 +4036,17 @@ Model
             * `Changing run-time limits <https://www.sqlite.org/c3ref/limit.html>`_
             * `SQLite compile-time flags <https://www.sqlite.org/compile.html>`_
 
+        .. note::
+            The default return value is the number of rows modified. However,
+            when using Postgres, Peewee will return a cursor by default that
+            yields the primary-keys of the inserted rows. To disable this
+            functionality with Postgres, use an empty call to ``returning()``.
+
     .. py:classmethod:: insert_from(query, fields)
 
         :param Select query: SELECT query to use as source of data.
         :param fields: Fields to insert data into.
+        :return: number of rows modified (see note).
 
         INSERT data using a SELECT query as the source. This API should be used
         for queries of the form *INSERT INTO ... SELECT FROM ...*.
@@ -3766,6 +4063,12 @@ Model
             UserTweetDenorm.insert_from(
                 source,
                 [UserTweetDenorm.username, UserTweetDenorm.num_tweets]).execute()
+
+        .. note::
+            The default return value is the number of rows modified. However,
+            when using Postgres, Peewee will return a cursor by default that
+            yields the primary-keys of the inserted rows. To disable this
+            functionality with Postgres, use an empty call to ``returning()``.
 
     .. py:classmethod:: replace([__data=None[, **insert]])
 
@@ -3876,6 +4179,49 @@ Model
               clause).
             * SQLite generally has a limit of 999 bound parameters for a query,
               so the batch size should be roughly 1000 / number-of-fields.
+            * When a batch-size is provided it is **strongly recommended** that
+              you wrap the call in a transaction or savepoint using
+              :py:meth:`Database.atomic`. Otherwise an error in a batch mid-way
+              through could leave the database in an inconsistent state.
+
+    .. py:classmethod:: bulk_update(model_list, fields[, batch_size=None])
+
+        :param iterable model_list: a list or other iterable of
+            :py:class:`Model` instances.
+        :param list fields: list of fields to update.
+        :param int batch_size: number of rows to batch per insert. If
+            unspecified, all models will be inserted in a single query.
+        :returns: total number of rows updated.
+
+        Efficiently UPDATE multiple model instances.
+
+        Example:
+
+        .. code-block:: python
+
+            # First, create 3 users.
+            u1, u2, u3 = [User.create(username='u%s' % i) for i in (1, 2, 3)]
+
+            # Now let's modify their usernames.
+            u1.username = 'u1-x'
+            u2.username = 'u2-y'
+            u3.username = 'u3-z'
+
+            # Update all three rows using a single UPDATE query.
+            User.bulk_update([u1, u2, u3], fields=[User.username])
+
+        If you have a large number of objects to update, it is strongly
+        recommended that you specify a ``batch_size`` and wrap the operation in
+        a transaction:
+
+        .. code-block:: python
+
+            with database.atomic():
+                User.bulk_update(user_list, fields=['username'], batch_size=50)
+
+        .. warning::
+
+            * SQLite generally has a limit of 999 bound parameters for a query.
             * When a batch-size is provided it is **strongly recommended** that
               you wrap the call in a transaction or savepoint using
               :py:meth:`Database.atomic`. Otherwise an error in a batch mid-way
@@ -4114,6 +4460,13 @@ Model
             include an ``IF EXISTS`` clause.
 
         Drop the model table.
+
+    .. py:method:: truncate_table([restart_identity=False[, cascade=False]])
+
+        :param bool restart_identity: Restart the id sequence (postgres-only).
+        :param bool cascade: Truncate related tables as well (postgres-only).
+
+        Truncate (delete all rows) for the model.
 
     .. py:classmethod:: index(*fields[, unique=False[, safe=True[, where=None[, using=None[, name=None]]]]])
 
@@ -4578,6 +4931,13 @@ Constants and Helpers
         :returns: self
 
         Add a callback to be executed when the proxy is initialized.
+
+.. py:class:: DatabaseProxy()
+
+    Proxy subclass that is suitable to use as a placeholder for a
+    :py:class:`Database` instance.
+
+    See :ref:`dynamic_db` for details on usage.
 
 .. py:function:: chunked(iterable, n)
 

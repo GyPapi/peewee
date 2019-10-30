@@ -215,6 +215,32 @@ the :py:meth:`~Model.bulk_create` API:
     the previously-unsaved model instances will have their new primary key
     values automatically populated.
 
+In addition, Peewee also offers :py:meth:`Model.bulk_update`, which can
+efficiently update one or more columns on a list of models. For example:
+
+.. code-block:: python
+
+    # First, create 3 users with usernames u1, u2, u3.
+    u1, u2, u3 = [User.create(username='u%s' % i) for i in (1, 2, 3)]
+
+    # Now we'll modify the user instances.
+    u1.username = 'u1-x'
+    u2.username = 'u2-y'
+    u3.username = 'u3-z'
+
+    # Update all three users with a single UPDATE query.
+    User.bulk_update([u1, u2, u3], fields=[User.username])
+
+.. note::
+    For large lists of objects, you should specify a reasonable batch_size and
+    wrap the call to :py:meth:`~Model.bulk_update` with
+    :py:meth:`Database.atomic`:
+
+    .. code-block:: python
+
+        with database.atomic():
+            User.bulk_update(list_of_users, fields=['username'], batch_size=50)
+
 Alternatively, you can use the :py:meth:`Database.batch_commit` helper to
 process chunks of rows inside *batch*-sized transactions. This method also
 provides a workaround for databases besides Postgresql, when the primary-key of
@@ -286,8 +312,8 @@ where the keys correspond to the model's field names:
     >>> query.execute()  # Returns the number of rows that were updated.
     4
 
-For more information, see the documentation on :py:meth:`Model.update` and
-:py:class:`Update`.
+For more information, see the documentation on :py:meth:`Model.update`,
+:py:class:`Update` and :py:meth:`Model.bulk_update`.
 
 .. note::
     If you would like more information on performing atomic updates (such as
@@ -432,6 +458,39 @@ column will be updated, and no duplicate rows will be created.
 .. note::
     The main difference between MySQL and Postgresql/SQLite is that Postgresql
     and SQLite require that you specify a ``conflict_target``.
+
+Here is a more advanced (if contrived) example using the :py:class:`EXCLUDED`
+namespace. The :py:class:`EXCLUDED` helper allows us to reference values in the
+conflicting data. For our example, we'll assume a simple table mapping a unique
+key (string) to a value (integer):
+
+.. code-block:: python
+
+    class KV(Model):
+        key = CharField(unique=True)
+        value = IntegerField()
+
+    # Create one row.
+    KV.create(key='k1', value=1)
+
+    # Demonstrate usage of EXCLUDED.
+    # Here we will attempt to insert a new value for a given key. If that
+    # key already exists, then we will update its value with the *sum* of its
+    # original value and the value we attempted to insert -- provided that
+    # the new value is larger than the original value.
+    query = (KV.insert(key='k1', value=10)
+             .on_conflict(conflict_target=[KV.key],
+                          update={KV.value: KV.value + EXCLUDED.value},
+                          where=(EXCLUDED.value > KV.value)))
+
+    # Executing the above query will result in the following data being
+    # present in the "kv" table:
+    # (key='k1', value=11)
+    query.execute()
+
+    # If we attempted to execute the query *again*, then nothing would be
+    # updated, as the new value (10) is now less than the value in the
+    # original row (11).
 
 For more information, see :py:meth:`Insert.on_conflict` and
 :py:class:`OnConflict`.
@@ -1422,10 +1481,41 @@ each window has a unique alias:
     # 2           3.     34.      2.
     # 3         100     134.    100.
 
+Similarly, if you have multiple window definitions that share similar
+definitions, it is possible to extend a previously-defined window definition.
+For example, here we will be partitioning the data-set by the counter value, so
+we'll be doing our aggregations with respect to the counter. Then we'll define
+a second window that extends this partitioning, and adds an ordering clause:
+
+.. code-block:: python
+
+    w1 = Window(partition_by=[Sample.counter]).alias('w1')
+
+    # By extending w1, this window definition will also be partitioned
+    # by "counter".
+    w2 = Window(extends=w1, order_by=[Sample.value.desc()]).alias('w2')
+
+    query = (Sample
+             .select(Sample.counter, Sample.value,
+                     fn.SUM(Sample.value).over(w1).alias('group_sum'),
+                     fn.RANK().over(w2).alias('revrank'))
+             .window(w1, w2)
+             .order_by(Sample.id))
+
+    for sample in query:
+        print(sample.counter, sample.value, sample.group_sum, sample.revrank)
+
+    # counter  value   group_sum   revrank
+    # 1        10.     30.         2
+    # 1        20.     30.         1
+    # 2        1.      4.          2
+    # 2        3.      4.          1
+    # 3        100.    100.        1
+
 .. _window-frame-types:
 
-Frame types: RANGE vs ROWS
-^^^^^^^^^^^^^^^^^^^^^^^^^^
+Frame types: RANGE vs ROWS vs GROUPS
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Depending on the frame type, the database will process ordered groups
 differently. Let's create two additional ``Sample`` rows to visualize the
@@ -1458,6 +1548,7 @@ frame type, we can use either:
 
 * :py:attr:`Window.RANGE`
 * :py:attr:`Window.ROWS`
+* :py:attr:`Window.GROUPS`
 
 The behavior of :py:attr:`~Window.RANGE`, when there are logical duplicates,
 may lead to unexpected results:
@@ -1519,6 +1610,37 @@ Peewee uses these rules for determining what frame-type to use:
 * If the user did not specify frame type or start/end boundaries, Peewee will
   use the database default, which is ``RANGE``.
 
+The :py:attr:`Window.GROUPS` frame type looks at the window range specification
+in terms of groups of rows, based on the ordering term(s). Using ``GROUPS``, we
+can define the frame so it covers distinct groupings of rows. Let's look at an
+example:
+
+.. code-block:: python
+
+    query = (Sample
+             .select(Sample.counter, Sample.value,
+                     fn.SUM(Sample.value).over(
+                        order_by=[Sample.counter, Sample.value],
+                        frame_type=Window.GROUPS,
+                        start=Window.preceding(1)).alias('gsum'))
+             .order_by(Sample.counter, Sample.value))
+
+    for sample in query:
+        print(sample.counter, sample.value, sample.gsum)
+
+    #  counter   value    gsum
+    #  1         10       10
+    #  1         20       50
+    #  1         20       50   (10) + (20+0)
+    #  2         1        42
+    #  2         1        42   (20+20) + (1+1)
+    #  2         3        5    (1+1) + 3
+    #  3         100      103  (3) + 100
+
+As you can hopefully infer, the window is grouped by its ordering term, which
+is ``(counter, value)``. We are looking at a window that extends between one
+previous group and the current group.
+
 .. note::
     For information about the window function APIs, see:
 
@@ -1526,9 +1648,11 @@ Peewee uses these rules for determining what frame-type to use:
     * :py:meth:`Function.filter`
     * :py:class:`Window`
 
-    For general information on window functions, the
-    `postgresql docs <http://www.postgresql.org/docs/9.1/static/tutorial-window.html>`_.
-    have a good overview.
+    For general information on window functions, read the postgres `window functions tutorial <https://www.postgresql.org/docs/current/tutorial-window.html>`_
+
+    Additionally, the `postgres docs <https://www.postgresql.org/docs/current/sql-select.html#SQL-WINDOW>`_
+    and the `sqlite docs <https://www.sqlite.org/windowfunctions.html>`_
+    contain a lot of good information.
 
 .. _rowtypes:
 
