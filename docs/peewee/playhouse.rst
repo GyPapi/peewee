@@ -19,6 +19,7 @@ make up the ``playhouse``.
 * :ref:`apsw`
 * :ref:`sqlcipher_ext`
 * :ref:`postgres_ext`
+* :ref:`crdb`
 * :ref:`mysql_ext`
 
 **High-level features**
@@ -1585,6 +1586,9 @@ postgres_ext API notes
             # Perform a search using the "match" method.
             terms = 'python & (sqlite | postgres)'
             results = Blog.select().where(Blog.search_content.match(terms))
+
+
+.. include:: crdb.rst
 
 
 .. _mysql_ext:

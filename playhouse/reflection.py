@@ -24,6 +24,10 @@ try:
     from playhouse import postgres_ext
 except ImportError:
     postgres_ext = None
+try:
+    from playhouse.cockroachdb import CockroachDatabase
+except ImportError:
+    CockroachDatabase = None
 
 RESERVED_WORDS = set([
     'and', 'as', 'assert', 'break', 'class', 'continue', 'def', 'del', 'elif',
@@ -220,7 +224,7 @@ class PostgresqlMetadata(Metadata):
         16: BooleanField,
         17: BlobField,
         20: BigIntegerField,
-        21: IntegerField,
+        21: SmallIntegerField,
         23: IntegerField,
         25: TextField,
         700: FloatField,
@@ -233,7 +237,7 @@ class PostgresqlMetadata(Metadata):
         1083: TimeField,
         1266: TimeField,
         1700: DecimalField,
-        2950: TextField, # UUID
+        2950: UUIDField, # UUID
     }
     array_types = {
         1000: BooleanField,
@@ -283,13 +287,13 @@ class PostgresqlMetadata(Metadata):
             postgres_ext.HStoreField)) if postgres_ext is not None else set()
 
         # Look up the actual column type for each column.
-        identifier = '"%s"."%s"' % (schema, table)
-        cursor = self.execute('SELECT * FROM %s LIMIT 1' % identifier)
+        identifier = '%s.%s' % (schema, table)
+        cursor = self.execute(
+            'SELECT attname, atttypid FROM pg_catalog.pg_attribute '
+            'WHERE attrelid = %s::regclass AND attnum > %s', identifier, 0)
 
         # Store column metadata in dictionary keyed by column name.
-        for column_description in cursor.description:
-            name = column_description.name
-            oid = column_description.type_code
+        for name, oid in cursor.fetchall():
             column_types[name] = self.column_map.get(oid, UnknownField)
             if column_types[name] in extension_types:
                 self.requires_extension = True
@@ -313,6 +317,33 @@ class PostgresqlMetadata(Metadata):
     def get_indexes(self, table, schema=None):
         schema = schema or 'public'
         return super(PostgresqlMetadata, self).get_indexes(table, schema)
+
+
+class CockroachDBMetadata(PostgresqlMetadata):
+    # CRDB treats INT the same as BIGINT, so we just map bigint type OIDs to
+    # regular IntegerField.
+    column_map = PostgresqlMetadata.column_map.copy()
+    column_map[20] = IntegerField
+    array_types = PostgresqlMetadata.array_types.copy()
+    array_types[1016] = IntegerField
+    extension_import = 'from playhouse.cockroachdb import *'
+
+    def __init__(self, database):
+        Metadata.__init__(self, database)
+        self.requires_extension = True
+
+        if postgres_ext is not None:
+            # Attempt to add JSON types.
+            cursor = self.execute('select oid, typname, format_type(oid, NULL)'
+                                  ' from pg_type;')
+            results = cursor.fetchall()
+
+            for oid, typname, formatted_type in results:
+                if typname == 'jsonb':
+                    self.column_map[oid] = postgres_ext.BinaryJSONField
+
+            for oid in self.array_types:
+                self.column_map[oid] = postgres_ext.ArrayField
 
 
 class MySQLMetadata(Metadata):
@@ -458,7 +489,9 @@ class Introspector(object):
 
     @classmethod
     def from_database(cls, database, schema=None):
-        if isinstance(database, PostgresqlDatabase):
+        if CockroachDatabase and isinstance(database, CockroachDatabase):
+            metadata = CockroachDBMetadata(database)
+        elif isinstance(database, PostgresqlDatabase):
             metadata = PostgresqlMetadata(database)
         elif isinstance(database, MySQLDatabase):
             metadata = MySQLMetadata(database)

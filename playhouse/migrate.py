@@ -131,6 +131,10 @@ from peewee import OP
 from peewee import callable_
 from peewee import sort_models
 from peewee import _truncate_constraint_name
+try:
+    from playhouse.cockroachdb import CockroachDatabase
+except ImportError:
+    CockroachDatabase = None
 
 
 class Operation(object):
@@ -190,7 +194,9 @@ class SchemaMigrator(object):
 
     @classmethod
     def from_database(cls, database):
-        if isinstance(database, PostgresqlDatabase):
+        if CockroachDatabase and isinstance(database, CockroachDatabase):
+            return CockroachDBMigrator(database)
+        elif isinstance(database, PostgresqlDatabase):
             return PostgresqlMigrator(database)
         elif isinstance(database, MySQLDatabase):
             return MySQLMigrator(database)
@@ -462,6 +468,21 @@ class PostgresqlMigrator(SchemaMigrator):
                     seq_name, new_seq_name))
 
         return operations
+
+
+class CockroachDBMigrator(PostgresqlMigrator):
+    explicit_create_foreign_key = True
+
+    def add_inline_fk_sql(self, ctx, field):
+        pass
+
+    @operation
+    def drop_index(self, table, index_name):
+        return (self
+                .make_context()
+                .literal('DROP INDEX ')
+                .sql(Entity(index_name))
+                .literal(' CASCADE'))
 
 
 class MySQLColumn(namedtuple('_Column', ('name', 'definition', 'null', 'pk',

@@ -7,15 +7,65 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+[View commits](https://github.com/coleifer/peewee/compare/3.13.1...master)
+
+## 3.13.1
+
+Fix a regression when specifying keyword arguments to the `atomic()` or
+`transaction()` helper methods. Note: this only occurs if you were using Sqlite
+and were explicitly setting the `lock_type=` parameter.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.13.0...3.13.1)
+
+## 3.13.0
+
+### CockroachDB support added
+
+This will be a notable release as it adds support for
+[CockroachDB](https://cockroachlabs.com/), a distributed, horizontally-scalable
+SQL database.
+
+* [CockroachDB usage overview](http://docs.peewee-orm.com/en/latest/peewee/database.html#using-crdb)
+* [CockroachDB API documentation](http://docs.peewee-orm.com/en/latest/peewee/playhouse.html#crdb)
+
+### Other features and fixes
+
+* Allow `FOR UPDATE` clause to specify one or more tables (`FOR UPDATE OF...`).
+* Support for Postgres `LATERAL` join.
+* Properly wrap exceptions raised during explicit commit/rollback in the
+  appropriate peewee-specific exception class.
+* Capture original exception object and expose it as `exc.orig` on the
+  wrapped exception.
+* Properly introspect `SMALLINT` columns in Postgres schema reflection.
+* More flexible handling of passing database-specific arguments to `atomic()`
+  and `transaction()` context-manager/decorator.
+* Fix non-deterministic join ordering issue when using the `filter()` API
+  across several tables (#2063).
+
+[View commits](https://github.com/coleifer/peewee/compare/3.12.0...3.13.0)
+
+## 3.12.0
+
 * Bulk insert (`insert_many()` and `insert_from()`) will now return the row
   count instead of the last insert ID. If you are using Postgres, peewee will
   continue to return a cursor that provides an iterator over the newly-inserted
   primary-key values by default. This behavior is being retained by default for
   compatibility. Postgres users can simply specify an empty `returning()` call
   to disable the cursor and retrieve the rowcount instead.
-* Migration extension now supports altering a column's data-type.
+* Migration extension now supports altering a column's data-type, via the new
+  `alter_column_type()` method.
+* Added `Database.is_connection_usabe()` method, which attempts to look at the
+  status of the underlying DB-API connection to determine whether the
+  connection is usable.
+* Common table expressions include a `materialized` parameter, which can be
+  used to control Postgres' optimization fencing around CTEs.
+* Added `BloomFilter.from_buffer()` method for populating a bloom-filter from
+  the output of a previous call to the `to_buffer()` method.
+* Fixed APSW extension's `commit()` and `rollback()` methods to no-op if the
+  database is in auto-commit mode.
+* Added `generate_always=` option to the `IdentityField` (defaults to False).
 
-[View commits](https://github.com/coleifer/peewee/compare/3.11.2...master)
+[View commits](https://github.com/coleifer/peewee/compare/3.11.2...3.12.0)
 
 ## 3.11.2
 

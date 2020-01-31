@@ -5,6 +5,7 @@ from functools import partial
 from peewee import *
 from playhouse.migrate import *
 from .base import BaseTestCase
+from .base import IS_CRDB
 from .base import IS_MYSQL
 from .base import IS_POSTGRESQL
 from .base import IS_SQLITE
@@ -13,6 +14,7 @@ from .base import TestModel
 from .base import db
 from .base import get_in_memory_db
 from .base import requires_models
+from .base import requires_pglike
 from .base import requires_postgresql
 from .base import requires_sqlite
 from .base import skip_if
@@ -83,7 +85,7 @@ class TestSchemaMigration(ModelTestCase):
         finally:
             self.database.close()
 
-    @requires_postgresql
+    @requires_pglike
     def test_add_table_constraint(self):
         price = FloatField(default=0.)
         migrate(self.migrator.add_column('tag', 'price', price),
@@ -121,7 +123,7 @@ class TestSchemaMigration(ModelTestCase):
         with self.database.atomic():
             self.assertRaises(IntegrityError, Tag2.create, tag='t2', alt_id=1)
 
-    @requires_postgresql
+    @requires_pglike
     def test_drop_table_constraint(self):
         price = FloatField(default=0.)
         migrate(
@@ -321,7 +323,8 @@ class TestSchemaMigration(ModelTestCase):
         # We cannot make the `dob` field not null because there is currently
         # a null value there.
         if self._exception_add_not_null:
-            self.assertRaises(IntegrityError, addNotNull)
+            with self.assertRaisesCtx((IntegrityError, InternalError)):
+                addNotNull()
 
         (Person
          .update(dob=datetime.date(2000, 1, 2))
@@ -363,7 +366,8 @@ class TestSchemaMigration(ModelTestCase):
                 migrate(self.migrator.add_not_null('page', 'user_id'))
 
         if self._exception_add_not_null:
-            self.assertRaises(IntegrityError, addNotNull)
+            with self.assertRaisesCtx((IntegrityError, InternalError)):
+                addNotNull()
 
         with self.database.transaction():
             Page.update(user=user).where(Page.user.is_null()).execute()
@@ -422,11 +426,8 @@ class TestSchemaMigration(ModelTestCase):
 
         Person.create(first_name='first', last_name='last')
         with self.database.transaction():
-            self.assertRaises(
-                IntegrityError,
-                Person.create,
-                first_name='first',
-                last_name='last')
+            with self.assertRaisesCtx((IntegrityError, InternalError)):
+                Person.create(first_name='first', last_name='last')
 
     def test_add_unique_column(self):
         uf = CharField(default='', unique=True)
@@ -569,6 +570,7 @@ class TestSchemaMigration(ModelTestCase):
             ['id', 'name'])
         self.assertEqual(self.database.get_foreign_keys('page'), [])
 
+    @skip_if(IS_CRDB, 'crdb does not clean up old constraint')
     def test_rename_foreign_key(self):
         migrate(self.migrator.rename_column('page', 'user_id', 'huey_id'))
         columns = self.database.get_columns('page')
@@ -583,6 +585,7 @@ class TestSchemaMigration(ModelTestCase):
         self.assertEqual(foreign_key.dest_column, 'id')
         self.assertEqual(foreign_key.dest_table, 'users')
 
+    @skip_if(IS_CRDB, 'crdb does not clean up old constraint')
     def test_rename_unique_foreign_key(self):
         migrate(self.migrator.rename_column('session', 'user_id', 'huey_id'))
         columns = self.database.get_columns('session')
@@ -597,7 +600,7 @@ class TestSchemaMigration(ModelTestCase):
         self.assertEqual(foreign_key.dest_column, 'id')
         self.assertEqual(foreign_key.dest_table, 'users')
 
-    @requires_postgresql
+    @requires_pglike
     @requires_models(Tag)
     def test_add_column_with_index_type(self):
         from playhouse.postgres_ext import BinaryJSONField
@@ -611,6 +614,7 @@ class TestSchemaMigration(ModelTestCase):
              []),
         ])
 
+    @skip_if(IS_CRDB, 'crdb is still finnicky about changing types.')
     def test_alter_column_type(self):
         # Convert varchar to text.
         field = TextField()
@@ -624,14 +628,14 @@ class TestSchemaMigration(ModelTestCase):
         field = DateTimeField()
         migrate(self.migrator.alter_column_type('person', 'dob', field))
         _, _, _, dob = self.database.get_columns('person')
-        if IS_POSTGRESQL:
+        if IS_POSTGRESQL or IS_CRDB:
             self.assertTrue(dob.data_type.startswith('timestamp'))
         else:
             self.assertEqual(dob.data_type.lower(), 'datetime')
 
         # Convert text to integer.
         field = IntegerField()
-        cast = '(tag::integer)' if IS_POSTGRESQL else None
+        cast = '(tag::integer)' if IS_POSTGRESQL or IS_CRDB else None
         migrate(self.migrator.alter_column_type('tag', 'tag', field, cast))
         _, tag = self.database.get_columns('tag')
         if IS_SQLITE:

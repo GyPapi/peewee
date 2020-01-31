@@ -6,6 +6,7 @@ import unittest
 from peewee import *
 from peewee import Entity
 from peewee import NodeList
+from peewee import SubclassAwareMetadata
 from peewee import sort_models
 
 from .base import db
@@ -14,11 +15,13 @@ from .base import mock
 from .base import new_connection
 from .base import requires_models
 from .base import requires_mysql
+from .base import requires_pglike
 from .base import requires_postgresql
 from .base import requires_sqlite
 from .base import skip_if
 from .base import skip_unless
 from .base import BaseTestCase
+from .base import IS_CRDB
 from .base import IS_MYSQL
 from .base import IS_MYSQL_ADVANCED_FEATURES
 from .base import IS_POSTGRESQL
@@ -122,8 +125,9 @@ class TestModelAPIs(ModelTestCase):
             self.assertEqual(pn.post.content, 'p2')
 
         if not IS_SQLITE:
+            exc_class = ProgrammingError if IS_CRDB else IntegrityError
             with self.database.atomic() as txn:
-                self.assertRaises(IntegrityError, PostNote.create, note='pxn')
+                self.assertRaises(exc_class, PostNote.create, note='pxn')
                 txn.rollback()
 
     @requires_models(User, Tweet)
@@ -154,6 +158,17 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(pd1['timestamp'], ts)
         self.assertEqual(pd2['content'], 'p2')
         self.assertEqual(pd2['timestamp'], ts2)
+
+    @requires_models(User)
+    def test_insert_many(self):
+        data = [('u%02d' % i,) for i in range(100)]
+        with self.database.atomic():
+            for chunk in chunked(data, 10):
+                User.insert_many(chunk).execute()
+
+        self.assertEqual(User.select().count(), 100)
+        names = [u.username for u in User.select().order_by(User.username)]
+        self.assertEqual(names, ['u%02d' % i for i in range(100)])
 
     @requires_models(User, Tweet)
     def test_create(self):
@@ -354,7 +369,7 @@ class TestModelAPIs(ModelTestCase):
         self.assertEqual(t2.timestamp, datetime.datetime(2019, 1, 3, 0, 0, 0))
         self.assertEqual(t3.timestamp, t3_dt)
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL)
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB)
     @requires_models(CPK)
     def test_bulk_update_cte(self):
         CPK.insert_many([('k1', 1, 1), ('k2', 2, 2), ('k3', 3, 3)]).execute()
@@ -386,7 +401,7 @@ class TestModelAPIs(ModelTestCase):
         User.create(username='u0')  # Ensure that last insert ID != rowcount.
 
         iq = User.insert_many([(u,) for u in ('u1', 'u2', 'u3')])
-        if IS_POSTGRESQL:
+        if IS_POSTGRESQL or IS_CRDB:
             iq = iq.returning()
         self.assertEqual(iq.execute(), 3)
 
@@ -398,7 +413,7 @@ class TestModelAPIs(ModelTestCase):
                  .select(User.username.concat('-x'))
                  .where(User.username.in_(['u1', 'u2'])))
         iq = User.insert_from(query, ['username'])
-        if IS_POSTGRESQL:
+        if IS_POSTGRESQL or IS_CRDB:
             iq = iq.returning()
         self.assertEqual(iq.execute(), 2)
 
@@ -408,7 +423,7 @@ class TestModelAPIs(ModelTestCase):
         iq = User.insert_from(query, ['username']).returning()
         self.assertEqual(iq.execute(), 2)
 
-    @skip_if(IS_POSTGRESQL, 'requires sqlite or mysql')
+    @skip_if(IS_POSTGRESQL or IS_CRDB, 'requires sqlite or mysql')
     @requires_models(Emp)
     def test_replace_rowcount(self):
         Emp.create(first='beanie', last='cat', empno='998')
@@ -1006,7 +1021,8 @@ class TestModelAPIs(ModelTestCase):
         names = []
         for name, count in sorted(name2count.items()):
             names += [name] * count
-        User.insert_many([(n,) for n in names], [User.username]).execute()
+        User.insert_many([(i, n) for i, n in enumerate(names, 1)],
+                         [User.id, User.username]).execute()
 
         # The results we are trying to obtain.
         expected = [
@@ -1065,7 +1081,7 @@ class TestModelAPIs(ModelTestCase):
                 ('mickey', 2),
                 ('zaizee', 0)])
 
-    @requires_postgresql
+    @requires_pglike
     @requires_models(User)
     def test_join_on_valueslist(self):
         for username in ('huey', 'mickey', 'zaizee'):
@@ -1079,7 +1095,7 @@ class TestModelAPIs(ModelTestCase):
                      .order_by(vl.c.username.desc()))
             self.assertEqual([u.username for u in query], ['zaizee', 'huey'])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL)
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB)
     @requires_models(User)
     def test_multi_update(self):
         data = [(i, 'u%s' % i) for i in range(1, 4)]
@@ -1145,8 +1161,8 @@ class TestModelAPIs(ModelTestCase):
 
     @requires_models(User, Tweet)
     def test_union_column_resolution(self):
-        u1 = User.create(username='u1')
-        u2 = User.create(username='u2')
+        u1 = User.create(id=1, username='u1')
+        u2 = User.create(id=2, username='u2')
         q1 = User.select().where(User.id == 1)
         q2 = User.select()
         union = q1 | q2
@@ -1161,9 +1177,9 @@ class TestModelAPIs(ModelTestCase):
             (1, 'u1'),
             (2, 'u2')])
 
-        t1_1 = Tweet.create(user=u1, content='u1-t1')
-        t1_2 = Tweet.create(user=u1, content='u1-t2')
-        t2_1 = Tweet.create(user=u2, content='u2-t1')
+        t1_1 = Tweet.create(id=1, user=u1, content='u1-t1')
+        t1_2 = Tweet.create(id=2, user=u1, content='u1-t2')
+        t2_1 = Tweet.create(id=3, user=u2, content='u2-t1')
 
         with self.assertQueryCount(1):
             q1 = Tweet.select(Tweet, User).join(User).where(User.id == 1)
@@ -1783,12 +1799,13 @@ class TestJoinModelAlias(ModelTestCase):
     def setUp(self):
         super(TestJoinModelAlias, self).setUp()
         users = {}
-        for username, tweet in self.data:
+        for pk, (username, tweet) in enumerate(self.data, 1):
             if username not in users:
-                users[username] = user = User.create(username=username)
+                user = User.create(id=len(users) + 1, username=username)
+                users[username] = user
             else:
                 user = users[username]
-            Tweet.create(user=user, content=tweet)
+            Tweet.create(id=pk, user=user, content=tweet)
 
     def _test_query(self, alias_expr):
         UA = alias_expr()
@@ -1944,8 +1961,9 @@ class TestJoinModelAlias(ModelTestCase):
                 self.assertEqual(data, [('meow', 'huey'), ('purr', 'huey')])
 
 
-@skip_unless(IS_POSTGRESQL or IS_MYSQL_ADVANCED_FEATURES or IS_SQLITE_25,
-             'window function')
+@skip_unless(
+    IS_POSTGRESQL or IS_MYSQL_ADVANCED_FEATURES or IS_SQLITE_25 or IS_CRDB,
+    'window function')
 class TestWindowFunctionIntegration(ModelTestCase):
     requires = [Sample]
 
@@ -2186,8 +2204,9 @@ class TestWindowFunctionIntegration(ModelTestCase):
 
 
 @skip_if(IS_SQLITE or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
+@skip_unless(db.for_update, 'requires for update')
 class TestForUpdateIntegration(ModelTestCase):
-    requires = [User]
+    requires = [User, Tweet]
 
     def setUp(self):
         super(TestForUpdateIntegration, self).setUp()
@@ -2196,7 +2215,12 @@ class TestForUpdateIntegration(ModelTestCase):
             class Meta:
                 database = self.alt_db
                 table_name = User._meta.table_name
+        class AltTweet(Tweet):
+            class Meta:
+                database = self.alt_db
+                table_name = Tweet._meta.table_name
         self.AltUser = AltUser
+        self.AltTweet = AltTweet
 
     def tearDown(self):
         self.alt_db.close()
@@ -2209,12 +2233,19 @@ class TestForUpdateIntegration(ModelTestCase):
         AltUser = self.AltUser
 
         with self.database.manual_commit():
-            users = User.select(User.username == 'zaizee').for_update()
+            users = User.select().where(User.username == 'zaizee').for_update()
             updated = (User
                        .update(username='ziggy')
                        .where(User.username == 'zaizee')
                        .execute())
             self.assertEqual(updated, 1)
+
+            if IS_POSTGRESQL:
+                nrows = (AltUser
+                         .update(username='huey-x')
+                         .where(AltUser.username == 'huey')
+                         .execute())
+                self.assertEqual(nrows, 1)
 
             query = (AltUser
                      .select(AltUser.username)
@@ -2224,6 +2255,16 @@ class TestForUpdateIntegration(ModelTestCase):
             self.database.commit()
             self.assertEqual(query.get().username, 'ziggy')
 
+    def test_for_update_nested(self):
+        User.insert_many([(u,) for u in 'abc']).execute()
+        subq = User.select().where(User.username != 'b').for_update()
+        nrows = (User
+                 .delete()
+                 .where(User.id.in_(subq))
+                 .execute())
+        self.assertEqual(nrows, 2)
+
+    @skip_if(IS_CRDB, 'crdb does not support "nowait" option')
     def test_for_update_nowait(self):
         User.create(username='huey')
         zaizee = User.create(username='zaizee')
@@ -2234,17 +2275,63 @@ class TestForUpdateIntegration(ModelTestCase):
             users = (User
                      .select(User.username)
                      .where(User.username == 'zaizee')
-                     .for_update('FOR UPDATE NOWAIT')
+                     .for_update(nowait=True)
                      .execute())
 
             def will_fail():
                 return (AltUser
                         .select()
                         .where(AltUser.username == 'zaizee')
-                        .for_update('FOR UPDATE NOWAIT')
+                        .for_update(nowait=True)
                         .get())
 
             self.assertRaises((OperationalError, InternalError), will_fail)
+
+    @requires_postgresql
+    @requires_models(User, Tweet)
+    def test_for_update_of(self):
+        h = User.create(username='huey')
+        z = User.create(username='zaizee')
+        Tweet.create(user=h, content='h')
+        Tweet.create(user=z, content='z')
+
+        AltUser, AltTweet = self.AltUser, self.AltTweet
+
+        with self.database.manual_commit():
+            # Lock tweets by huey.
+            query = (Tweet
+                     .select()
+                     .join(User)
+                     .where(User.username == 'huey')
+                     .for_update(of=Tweet, nowait=True))
+            qr = query.execute()
+
+            # No problem updating zaizee's tweet or huey's user.
+            nrows = (AltTweet
+                     .update(content='zx')
+                     .where(AltTweet.user == z.id)
+                     .execute())
+            self.assertEqual(nrows, 1)
+
+            nrows = (AltUser
+                     .update(username='huey-x')
+                     .where(AltUser.username == 'huey')
+                     .execute())
+            self.assertEqual(nrows, 1)
+
+            def will_fail():
+                (AltTweet
+                 .select()
+                 .where(AltTweet.user == h)
+                 .for_update(nowait=True)
+                 .get())
+            self.assertRaises((OperationalError, InternalError), will_fail)
+
+            self.database.commit()
+
+        query = Tweet.select(Tweet, User).join(User).order_by(Tweet.id)
+        self.assertEqual([(t.content, t.user.username) for t in query],
+                         [('h', 'huey-x'), ('zx', 'zaizee')])
 
 
 class ServerDefault(TestModel):
@@ -2476,7 +2563,8 @@ class TestCTEIntegration(ModelTestCase):
         c12 = CC(name='c12', parent=p1)
         c31 = CC(name='c31', parent=p3)
 
-    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES))
+    @skip_if(IS_SQLITE_OLD or (IS_MYSQL and not IS_MYSQL_ADVANCED_FEATURES)
+             or IS_CRDB)
     @requires_models(Member)
     def test_docs_example(self):
         f = Member.create(name='founder')
@@ -2568,7 +2656,7 @@ class TestCTEIntegration(ModelTestCase):
             ('p3', 'root'),
         ])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL, 'requires recursive cte support')
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB, 'requires recursive cte')
     def test_recursive_cte(self):
         def get_parents(cname):
             C1 = Category.alias()
@@ -2629,7 +2717,7 @@ class TestCTEIntegration(ModelTestCase):
         data = [(r.name, r.level, r.path) for r in query]
         self.assertEqual(data, [('root', 1, 'root')])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL, 'requires recursive cte support')
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB, 'requires recursive cte')
     def test_recursive_cte2(self):
         hierarchy = (Category
                      .select(Category.name, Value(0).alias('level'))
@@ -2654,7 +2742,7 @@ class TestCTEIntegration(ModelTestCase):
             ('p3', 1),
             ('root', 0)])
 
-    @skip_if(IS_SQLITE_OLD or IS_MYSQL, 'requires recursive cte support')
+    @skip_if(IS_SQLITE_OLD or IS_MYSQL or IS_CRDB, 'requires recursive cte')
     def test_recursive_cte_docs_example(self):
         # Define the base case of our recursive CTE. This will be categories that
         # have a null parent foreign-key.
@@ -2969,6 +3057,7 @@ class TestFieldInheritance(BaseTestCase):
         self.assertTrue(Category.itemb_set.model is Category)
 
     @skip_if(IS_SQLITE, 'sqlite is not supported')
+    @skip_if(IS_CRDB, 'crdb is not raising the error in this test(?)')
     def test_deferred_fk_creation(self):
         class B(TestModel):
             a = DeferredForeignKey('A', null=True)
@@ -3160,6 +3249,44 @@ class TestMetaInheritance(BaseTestCase):
         self.assertFalse(T3._meta.temporary)
 
 
+class TestModelMetadataMisc(BaseTestCase):
+    database = get_in_memory_db()
+
+    def test_subclass_aware_metadata(self):
+        class SchemaPropagateMetadata(SubclassAwareMetadata):
+            @property
+            def schema(self):
+                return self._schema
+            @schema.setter
+            def schema(self, value):
+                # self.models is a singleton, essentially, shared among all
+                # classes that use this metadata implementation.
+                for model in self.models:
+                    model._meta._schema = value
+
+        class Base(Model):
+            class Meta:
+                database = self.database
+                model_metadata_class = SchemaPropagateMetadata
+
+        class User(Base):
+            username = TextField()
+        class Tweet(Base):
+            user = ForeignKeyField(User, backref='tweets')
+            content = TextField()
+
+        self.assertTrue(User._meta.schema is None)
+        self.assertTrue(Tweet._meta.schema is None)
+
+        Base._meta.schema = 'temp'
+        self.assertEqual(User._meta.schema, 'temp')
+        self.assertEqual(Tweet._meta.schema, 'temp')
+
+        User._meta.schema = None
+        for model in (Base, User, Tweet):
+            self.assertTrue(model._meta.schema is None)
+
+
 class TestModelSetDatabase(BaseTestCase):
     def test_set_database(self):
         class Register(Model):
@@ -3304,7 +3431,8 @@ class OnConflictTests(object):
 
 
 def requires_upsert(m):
-    return skip_unless(IS_SQLITE_24 or IS_POSTGRESQL, 'requires upsert')(m)
+    return skip_unless(IS_SQLITE_24 or IS_POSTGRESQL or IS_CRDB,
+                       'requires upsert')(m)
 
 
 class KV(TestModel):
@@ -3441,6 +3569,7 @@ class PGOnConflictTests(OnConflictTests):
         self.assertEqual(KV.select(KV.key, KV.value).tuples()[:], [('k1', 11)])
 
     @requires_upsert
+    @skip_if(IS_CRDB, 'crdb does not support the WHERE clause')
     @requires_models(UKVP)
     def test_conflict_target_constraint_where(self):
         u1 = UKVP.create(key='k1', value=1, extra=1)
@@ -3699,8 +3828,9 @@ class UKVRel(TestModel):
         )
 
 
-@requires_postgresql
+@requires_pglike
 class TestUpsertPostgresql(PGOnConflictTests, ModelTestCase):
+    @requires_postgresql
     @requires_models(UKV)
     def test_conflict_target_constraint(self):
         u1 = UKV.create(key='k1', value='v1')
@@ -3919,8 +4049,8 @@ class TestCompoundSelectModels(ModelTestCase):
         self.ts = lambda i: datetime.datetime(2018, 1, i)
 
         with self.database.atomic():
-            for content in ('note-a', 'note-b', 'note-c'):
-                CNote.create(content=content, timestamp=make_ts())
+            for i, content in enumerate(('note-a', 'note-b', 'note-c'), 1):
+                CNote.create(id=i, content=content, timestamp=make_ts())
 
             file_data = (
                 ('peewee.txt', 'peewee orm'),
@@ -3974,7 +4104,7 @@ class SequenceModel(TestModel):
     key = TextField()
 
 
-@requires_postgresql
+@requires_pglike
 class TestSequence(ModelTestCase):
     requires = [SequenceModel]
 

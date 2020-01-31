@@ -65,7 +65,7 @@ except ImportError:
         mysql = None
 
 
-__version__ = '3.11.2'
+__version__ = '3.13.1'
 __all__ = [
     'AsIs',
     'AutoField',
@@ -320,13 +320,15 @@ FIELD = attrdict(
 #: Join helpers (for convenience) -- all join types are supported, this object
 #: is just to help avoid introducing errors by using strings everywhere.
 JOIN = attrdict(
-    INNER='INNER',
-    LEFT_OUTER='LEFT OUTER',
-    RIGHT_OUTER='RIGHT OUTER',
-    FULL='FULL',
-    FULL_OUTER='FULL OUTER',
-    CROSS='CROSS',
-    NATURAL='NATURAL')
+    INNER='INNER JOIN',
+    LEFT_OUTER='LEFT OUTER JOIN',
+    RIGHT_OUTER='RIGHT OUTER JOIN',
+    FULL='FULL JOIN',
+    FULL_OUTER='FULL OUTER JOIN',
+    CROSS='CROSS JOIN',
+    NATURAL='NATURAL JOIN',
+    LATERAL='LATERAL',
+    LEFT_LATERAL='LEFT JOIN LATERAL')
 
 # Row representations.
 ROW = attrdict(
@@ -450,12 +452,12 @@ class DatabaseProxy(Proxy):
     """
     def connection_context(self):
         return ConnectionContext(self)
-    def atomic(self):
-        return _atomic(self)
+    def atomic(self, *args, **kwargs):
+        return _atomic(self, *args, **kwargs)
     def manual_commit(self):
         return _manual(self)
-    def transaction(self):
-        return _transaction(self)
+    def transaction(self, *args, **kwargs):
+        return _transaction(self, *args, **kwargs)
     def savepoint(self):
         return _savepoint(self)
 
@@ -762,7 +764,7 @@ class Source(Node):
             columns = (SQL('*'),)
         return Select((self,), columns)
 
-    def join(self, dest, join_type='INNER', on=None):
+    def join(self, dest, join_type=JOIN.INNER, on=None):
         return Join(self, dest, join_type, on)
 
     def left_outer_join(self, dest, on=None):
@@ -828,7 +830,7 @@ def __bind_database__(meth):
     return inner
 
 
-def __join__(join_type='INNER', inverted=False):
+def __join__(join_type=JOIN.INNER, inverted=False):
     def method(self, other):
         if inverted:
             self, other = other, self
@@ -977,7 +979,7 @@ class Join(BaseTable):
     def __sql__(self, ctx):
         (ctx
          .sql(self.lhs)
-         .literal(' %s JOIN ' % self.join_type)
+         .literal(' %s ' % self.join_type)
          .sql(self.rhs))
         if self._on is not None:
             ctx.literal(' ON ').sql(self._on)
@@ -1481,6 +1483,7 @@ class Function(ColumnBase):
         self.name = name
         self.arguments = arguments
         self._filter = None
+        self._order_by = None
         self._python_value = python_value
         if name and name.lower() in ('sum', 'count', 'cast'):
             self._coerce = False
@@ -1495,6 +1498,10 @@ class Function(ColumnBase):
     @Node.copy
     def filter(self, where=None):
         self._filter = where
+
+    @Node.copy
+    def order_by(self, *ordering):
+        self._order_by = ordering
 
     @Node.copy
     def python_value(self, func=None):
@@ -1518,11 +1525,21 @@ class Function(ColumnBase):
         if not len(self.arguments):
             ctx.literal('()')
         else:
+            args = self.arguments
+
+            # If this is an ordered aggregate, then we will modify the last
+            # argument to append the ORDER BY ... clause. We do this to avoid
+            # double-wrapping any expression args in parentheses, as NodeList
+            # has a special check (hack) in place to work around this.
+            if self._order_by:
+                args = list(args)
+                args[-1] = NodeList((args[-1], SQL('ORDER BY'),
+                                     CommaNodeList(self._order_by)))
+
             with ctx(in_function=True, function_arg_count=len(self.arguments)):
                 ctx.sql(EnclosedNodeList([
-                    (argument if isinstance(argument, Node)
-                     else Value(argument, False))
-                    for argument in self.arguments]))
+                    (arg if isinstance(arg, Node) else Value(arg, False))
+                    for arg in args]))
 
         if self._filter:
             ctx.literal(' FILTER (WHERE ').sql(self._filter).literal(')')
@@ -1652,6 +1669,28 @@ class WindowAlias(Node):
 
     def __sql__(self, ctx):
         return ctx.literal(self.window._alias or 'w')
+
+
+class ForUpdate(Node):
+    def __init__(self, expr, of=None, nowait=None):
+        expr = 'FOR UPDATE' if expr is True else expr
+        if expr.lower().endswith('nowait'):
+            expr = expr[:-7]  # Strip off the "nowait" bit.
+            nowait = True
+
+        self._expr = expr
+        if of is not None and not isinstance(of, (list, set, tuple)):
+            of = (of,)
+        self._of = of
+        self._nowait = nowait
+
+    def __sql__(self, ctx):
+        ctx.literal(self._expr)
+        if self._of is not None:
+            ctx.literal(' OF ').sql(CommaNodeList(self._of))
+        if self._nowait:
+            ctx.literal(' NOWAIT')
+        return ctx
 
 
 def Case(predicate, expression_tuples, default=None):
@@ -2003,7 +2042,8 @@ class Query(BaseQuery):
              .sql(CommaNodeList(self._order_by)))
         if self._limit is not None or (self._offset is not None and
                                        ctx.state.limit_max):
-            ctx.literal(' LIMIT ').sql(self._limit or ctx.state.limit_max)
+            limit = ctx.state.limit_max if self._limit is None else self._limit
+            ctx.literal(' LIMIT ').sql(limit)
         if self._offset is not None:
             ctx.literal(' OFFSET ').sql(self._offset)
         return ctx
@@ -2182,7 +2222,7 @@ class CompoundSelectQuery(SelectBase):
 class Select(SelectBase):
     def __init__(self, from_list=None, columns=None, group_by=None,
                  having=None, distinct=None, windows=None, for_update=None,
-                 **kwargs):
+                 for_update_of=None, nowait=None, **kwargs):
         super(Select, self).__init__(**kwargs)
         self._from_list = (list(from_list) if isinstance(from_list, tuple)
                            else from_list) or []
@@ -2190,7 +2230,9 @@ class Select(SelectBase):
         self._group_by = group_by
         self._having = having
         self._windows = None
-        self._for_update = 'FOR UPDATE' if for_update is True else for_update
+        self._for_update = for_update  # XXX: consider reorganizing.
+        self._for_update_of = for_update_of
+        self._for_update_nowait = nowait
 
         self._distinct = self._simple_distinct = None
         if distinct:
@@ -2221,7 +2263,7 @@ class Select(SelectBase):
         self._from_list = list(sources)
 
     @Node.copy
-    def join(self, dest, join_type='INNER', on=None):
+    def join(self, dest, join_type=JOIN.INNER, on=None):
         if not self._from_list:
             raise ValueError('No sources to join on.')
         item = self._from_list.pop()
@@ -2266,8 +2308,12 @@ class Select(SelectBase):
         self._windows = windows if windows else None
 
     @Node.copy
-    def for_update(self, for_update=True):
-        self._for_update = 'FOR UPDATE' if for_update is True else for_update
+    def for_update(self, for_update=True, of=None, nowait=None):
+        if not for_update and (of is not None or nowait):
+            for_update = True
+        self._for_update = for_update
+        self._for_update_of = of
+        self._for_update_nowait = nowait
 
     def _get_query_key(self):
         return self._alias
@@ -2332,7 +2378,8 @@ class Select(SelectBase):
                     raise ValueError('FOR UPDATE specified but not supported '
                                      'by database.')
                 ctx.literal(' ')
-                ctx.sql(SQL(self._for_update))
+                ctx.sql(ForUpdate(self._for_update, self._for_update_of,
+                                  self._for_update_nowait))
 
         # If the subquery is inside a function -or- we are evaluating a
         # subquery on either side of an expression w/o an explicit alias, do
@@ -2766,7 +2813,11 @@ def _truncate_constraint_name(constraint, maxlen=64):
 # DB-API 2.0 EXCEPTIONS.
 
 
-class PeeweeException(Exception): pass
+class PeeweeException(Exception):
+    def __init__(self, *args):
+        if args and isinstance(args[0], Exception):
+            self.orig, args = args[0], args[1:]
+        super(PeeweeException, self).__init__(*args)
 class ImproperlyConfigured(PeeweeException): pass
 class DatabaseError(PeeweeException): pass
 class DataError(DatabaseError): pass
@@ -2793,7 +2844,7 @@ class ExceptionWrapper(object):
         if exc_type.__name__ in self.exceptions:
             new_type = self.exceptions[exc_type.__name__]
             exc_args = exc_value.args
-            reraise(new_type, new_type(*exc_args), traceback)
+            reraise(new_type, new_type(exc_value, *exc_args), traceback)
 
 
 EXCEPTIONS = {
@@ -2805,7 +2856,8 @@ EXCEPTIONS = {
     'InternalError': InternalError,
     'NotSupportedError': NotSupportedError,
     'OperationalError': OperationalError,
-    'ProgrammingError': ProgrammingError}
+    'ProgrammingError': ProgrammingError,
+    'TransactionRollbackError': OperationalError}
 
 __exception_wrapper__ = ExceptionWrapper(EXCEPTIONS)
 
@@ -3152,14 +3204,14 @@ class Database(_callable_context_manager):
         if self._state.transactions:
             return self._state.transactions[-1]
 
-    def atomic(self):
-        return _atomic(self)
+    def atomic(self, *args, **kwargs):
+        return _atomic(self, *args, **kwargs)
 
     def manual_commit(self):
         return _manual(self)
 
-    def transaction(self):
-        return _transaction(self)
+    def transaction(self, *args, **kwargs):
+        return _transaction(self, *args, **kwargs)
 
     def savepoint(self):
         return _savepoint(self)
@@ -3169,10 +3221,12 @@ class Database(_callable_context_manager):
             self.connect()
 
     def commit(self):
-        return self._state.conn.commit()
+        with __exception_wrapper__:
+            return self._state.conn.commit()
 
     def rollback(self):
-        return self._state.conn.rollback()
+        with __exception_wrapper__:
+            return self._state.conn.rollback()
 
     def batch_commit(self, it, n):
         for group in chunked(it, n):
@@ -3500,12 +3554,6 @@ class SqliteDatabase(Database):
             self.execute_sql('DETACH DATABASE "%s"' % name)
         return True
 
-    def atomic(self, lock_type=None):
-        return _atomic(self, lock_type=lock_type)
-
-    def transaction(self, lock_type=None):
-        return _transaction(self, lock_type=lock_type)
-
     def begin(self, lock_type=None):
         statement = 'BEGIN %s' % lock_type if lock_type else 'BEGIN'
         self.execute_sql(statement, commit=False)
@@ -3694,7 +3742,8 @@ class PostgresqlDatabase(Database):
         query = ('SELECT viewname, definition FROM pg_catalog.pg_views '
                  'WHERE schemaname = %s ORDER BY viewname')
         cursor = self.execute_sql(query, (schema or 'public',))
-        return [ViewMetadata(v, sql.strip()) for (v, sql) in cursor.fetchall()]
+        return [ViewMetadata(view_name, sql.strip(' \t;'))
+                for (view_name, sql) in cursor.fetchall()]
 
     def get_indexes(self, table, schema=None):
         query = """
@@ -3712,8 +3761,9 @@ class PostgresqlDatabase(Database):
             GROUP BY i.relname, idxs.indexdef, idx.indisunique
             ORDER BY idx.indisunique DESC, i.relname;"""
         cursor = self.execute_sql(query, (table, 'r', schema or 'public'))
-        return [IndexMetadata(row[0], row[1], row[3].split(','), row[2], table)
-                for row in cursor.fetchall()]
+        return [IndexMetadata(name, sql.rstrip(' ;'), columns.split(','),
+                              is_unique, table)
+                for name, sql, is_unique, columns in cursor.fetchall()]
 
     def get_columns(self, table, schema=None):
         query = """
@@ -3744,7 +3794,7 @@ class PostgresqlDatabase(Database):
 
     def get_foreign_keys(self, table, schema=None):
         sql = """
-            SELECT
+            SELECT DISTINCT
                 kcu.column_name, ccu.table_name, ccu.column_name
             FROM information_schema.table_constraints AS tc
             JOIN information_schema.key_column_usage AS kcu
@@ -4019,7 +4069,7 @@ class _manual(_callable_context_manager):
 
     def __enter__(self):
         top = self.db.top_transaction()
-        if top and not isinstance(self.db.top_transaction(), _manual):
+        if top is not None and not isinstance(top, _manual):
             raise ValueError('Cannot enter manual commit block while a '
                              'transaction is active.')
         self.db.push_transaction(self)
@@ -4031,14 +4081,14 @@ class _manual(_callable_context_manager):
 
 
 class _atomic(_callable_context_manager):
-    def __init__(self, db, lock_type=None):
+    def __init__(self, db, *args, **kwargs):
         self.db = db
-        self._lock_type = lock_type
-        self._transaction_args = (lock_type,) if lock_type is not None else ()
+        self._transaction_args = (args, kwargs)
 
     def __enter__(self):
         if self.db.transaction_depth() == 0:
-            self._helper = self.db.transaction(*self._transaction_args)
+            args, kwargs = self._transaction_args
+            self._helper = self.db.transaction(*args, **kwargs)
         elif isinstance(self.db.top_transaction(), _manual):
             raise ValueError('Cannot enter atomic commit block while in '
                              'manual commit mode.')
@@ -4051,15 +4101,13 @@ class _atomic(_callable_context_manager):
 
 
 class _transaction(_callable_context_manager):
-    def __init__(self, db, lock_type=None):
+    def __init__(self, db, *args, **kwargs):
         self.db = db
-        self._lock_type = lock_type
+        self._begin_args = (args, kwargs)
 
     def _begin(self):
-        if self._lock_type:
-            self.db.begin(self._lock_type)
-        else:
-            self.db.begin()
+        args, kwargs = self._begin_args
+        self.db.begin(*args, **kwargs)
 
     def commit(self, begin=True):
         self.db.commit()
@@ -4422,7 +4470,7 @@ class Field(ColumnBase):
         return value if value is None else self.adapt(value)
 
     def to_value(self, value):
-        return Value(value, self.db_value, self.unpack)
+        return Value(value, self.db_value, unpack=False)
 
     def get_sort_key(self, ctx):
         return self._sort_key
@@ -6923,10 +6971,12 @@ class ModelSelect(BaseModelSelect, Select):
         return to_field, False
 
     @Node.copy
-    def join(self, dest, join_type='INNER', on=None, src=None, attr=None):
+    def join(self, dest, join_type=JOIN.INNER, on=None, src=None, attr=None):
         src = self._join_ctx if src is None else src
 
-        if join_type != JOIN.CROSS:
+        if join_type == JOIN.LATERAL or join_type == JOIN.LEFT_LATERAL:
+            on = True
+        elif join_type != JOIN.CROSS:
             on, attr, constructor = self._normalize_join(src, dest, on, attr)
             if attr:
                 self._joins.setdefault(src, [])
@@ -6940,7 +6990,7 @@ class ModelSelect(BaseModelSelect, Select):
         item = self._from_list.pop()
         self._from_list.append(Join(item, dest, join_type, on))
 
-    def join_from(self, src, dest, join_type='INNER', on=None, attr=None):
+    def join_from(self, src, dest, join_type=JOIN.INNER, on=None, attr=None):
         return self.join(dest, join_type, on, src, attr)
 
     def _get_model_cursor_wrapper(self, cursor):
@@ -7000,7 +7050,8 @@ class ModelSelect(BaseModelSelect, Select):
 
         # dq_node should now be an Expression, lhs = Node(), rhs = ...
         q = collections.deque([dq_node])
-        dq_joins = set()
+        dq_joins = []
+        seen_joins = set()
         while q:
             curr = q.popleft()
             if not isinstance(curr, Expression):
@@ -7008,7 +7059,10 @@ class ModelSelect(BaseModelSelect, Select):
             for side, piece in (('lhs', curr.lhs), ('rhs', curr.rhs)):
                 if isinstance(piece, DQ):
                     query, joins = self.convert_dict_to_node(piece.query)
-                    dq_joins.update(joins)
+                    for join in joins:
+                        if join not in seen_joins:
+                            dq_joins.append(join)
+                            seen_joins.add(join)
                     expression = reduce(operator.and_, query)
                     # Apply values from the DQ object.
                     if piece._negated:
@@ -7410,7 +7464,7 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
             # If no fields were set on either the source or the destination,
             # then we have nothing to do here.
             if instance not in set_keys and dest not in set_keys \
-               and join_type.endswith('OUTER'):
+               and join_type.endswith('OUTER JOIN'):
                 continue
 
             if is_dict:
@@ -7458,6 +7512,7 @@ class PrefetchQuery(collections.namedtuple('_PrefetchQuery', (
                 rel_instances = id_map.get(key, [])
                 for inst in rel_instances:
                     setattr(inst, attname, instance)
+                    inst._dirty.clear()
                 setattr(instance, field.backref, rel_instances)
 
     def store_instance(self, instance, id_map):

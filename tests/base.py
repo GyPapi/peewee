@@ -13,6 +13,7 @@ except ImportError:
 from peewee import *
 from peewee import sqlite3
 from playhouse.mysql_ext import MySQLConnectorDatabase
+from playhouse.cockroachdb import CockroachDatabase
 
 
 logger = logging.getLogger('peewee')
@@ -25,6 +26,7 @@ def db_loader(engine, name='peewee_test', db_class=None, **params):
             MySQLDatabase: ['mysql'],
             PostgresqlDatabase: ['postgres', 'postgresql'],
             MySQLConnectorDatabase: ['mysqlconnector'],
+            CockroachDatabase: ['cockroach', 'cockroachdb', 'crdb'],
         }
         engine_map = dict((alias, db) for db, aliases in engine_aliases.items()
                           for alias in aliases)
@@ -35,6 +37,8 @@ def db_loader(engine, name='peewee_test', db_class=None, **params):
         name = '%s.db' % name if name != ':memory:' else name
     elif issubclass(db_class, MySQLDatabase):
         params.update(MYSQL_PARAMS)
+    elif issubclass(db_class, CockroachDatabase):
+        params.update(CRDB_PARAMS)
     elif issubclass(db_class, PostgresqlDatabase):
         params.update(PSQL_PARAMS)
     return db_class(name, **params)
@@ -50,6 +54,7 @@ VERBOSITY = int(os.environ.get('PEEWEE_TEST_VERBOSITY') or 1)
 IS_SQLITE = BACKEND in ('sqlite', 'sqlite3')
 IS_MYSQL = BACKEND in ('mysql', 'mysqlconnector')
 IS_POSTGRESQL = BACKEND in ('postgres', 'postgresql')
+IS_CRDB = BACKEND in ('cockroach', 'cockroachdb', 'crdb')
 
 
 def make_db_params(key):
@@ -62,6 +67,7 @@ def make_db_params(key):
             params[param] = int(value) if param == 'port' else value
     return params
 
+CRDB_PARAMS = make_db_params('CRDB')
 MYSQL_PARAMS = make_db_params('MYSQL')
 PSQL_PARAMS = make_db_params('PSQL')
 
@@ -73,8 +79,8 @@ if VERBOSITY > 2:
     handler.setLevel(logging.DEBUG)
 
 
-def new_connection():
-    return db_loader(BACKEND, 'peewee_test')
+def new_connection(**kwargs):
+    return db_loader(BACKEND, 'peewee_test', **kwargs)
 
 
 db = new_connection()
@@ -269,3 +275,6 @@ def requires_mysql(method):
 
 def requires_postgresql(method):
     return skip_unless(IS_POSTGRESQL, 'requires postgresql')(method)
+
+def requires_pglike(method):
+    return skip_unless(IS_POSTGRESQL or IS_CRDB, 'requires pg-like')(method)

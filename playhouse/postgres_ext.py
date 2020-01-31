@@ -21,7 +21,11 @@ try:
 except ImportError:
     pass
 
-from psycopg2.extras import register_hstore
+try:
+    from psycopg2.extras import register_hstore
+except ImportError:
+    def register_hstore(c, globally):
+        pass
 try:
     from psycopg2.extras import Json
 except:
@@ -127,14 +131,20 @@ class ObjectSlice(_LookupNode):
             parts = [value.start or 0, value.stop or 0]
         elif isinstance(value, int):
             parts = [value]
+        elif isinstance(value, Node):
+            parts = value
         else:
-            parts = map(int, value.split(':'))
+            # Assumes colon-separated integer indexes.
+            parts = [int(i) for i in value.split(':')]
         return cls(node, parts)
 
     def __sql__(self, ctx):
-        return (ctx
-                .sql(self.node)
-                .literal('[%s]' % ':'.join(str(p + 1) for p in self.parts)))
+        ctx.sql(self.node)
+        if isinstance(self.parts, Node):
+            ctx.literal('[').sql(self.parts).literal(']')
+        else:
+            ctx.literal('[%s]' % ':'.join(str(p + 1) for p in self.parts))
+        return ctx
 
     def __getitem__(self, value):
         return ObjectSlice.create(self, value)
@@ -150,7 +160,6 @@ class IndexedFieldMixin(object):
 
 class ArrayField(IndexedFieldMixin, Field):
     passthrough = True
-    unpack = False
 
     def __init__(self, field_class=IntegerField, field_kwargs=None,
                  dimensions=1, convert_values=False, *args, **kwargs):
@@ -234,7 +243,6 @@ class DateTimeTZField(DateTimeField):
 
 class HStoreField(IndexedFieldMixin, Field):
     field_type = 'HSTORE'
-    unpack = False
     __hash__ = Field.__hash__
 
     def __getitem__(self, key):
@@ -280,7 +288,6 @@ class HStoreField(IndexedFieldMixin, Field):
 
 class JSONField(Field):
     field_type = 'JSON'
-    unpack = False
     _json_datatype = 'json'
 
     def __init__(self, dumps=None, *args, **kwargs):
@@ -318,6 +325,8 @@ class BinaryJSONField(IndexedFieldMixin, JSONField):
     def contains(self, other):
         if isinstance(other, (list, dict)):
             return Expression(self, JSONB_CONTAINS, Json(other))
+        elif isinstance(other, JSONField):
+            return Expression(self, JSONB_CONTAINS, other)
         return Expression(cast_jsonb(self), JSONB_EXISTS, other)
 
     def contained_by(self, other):

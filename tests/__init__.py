@@ -4,7 +4,7 @@ import unittest
 from peewee import OperationalError
 
 # Core modules.
-from .database import *
+from .db_tests import *
 from .expressions import *
 from .fields import *
 from .keys import *
@@ -25,6 +25,10 @@ try:
     from .apsw_ext import *
 except ImportError:
     print('Unable to import APSW extension tests, skipping.')
+try:
+    from .cockroachdb import *
+except ImportError:
+    print('Unable to import CockroachDB tests, skipping.')
 try:
     from .cysqlite import *
 except ImportError:

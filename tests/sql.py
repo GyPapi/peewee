@@ -232,6 +232,29 @@ class TestSelectQuery(BaseTestCase):
             'WHERE (("t1"."dob" > ?) OR ("t1"."dob" < ?))'),
             [datetime.date(1980, 1, 1), datetime.date(1950, 1, 1)])
 
+    def test_limit(self):
+        base = User.select(User.c.id)
+        self.assertSQL(base.limit(None), (
+            'SELECT "t1"."id" FROM "users" AS "t1"'), [])
+        self.assertSQL(base.limit(10), (
+            'SELECT "t1"."id" FROM "users" AS "t1" LIMIT ?'), [10])
+        self.assertSQL(base.limit(10).offset(3), (
+            'SELECT "t1"."id" FROM "users" AS "t1" '
+            'LIMIT ? OFFSET ?'), [10, 3])
+        self.assertSQL(base.limit(0), (
+            'SELECT "t1"."id" FROM "users" AS "t1" LIMIT ?'), [0])
+
+        self.assertSQL(base.offset(3), (
+            'SELECT "t1"."id" FROM "users" AS "t1" OFFSET ?'), [3],
+            limit_max=None)
+        # Some databases do not support offset without corresponding LIMIT:
+        self.assertSQL(base.offset(3), (
+            'SELECT "t1"."id" FROM "users" AS "t1" LIMIT ? OFFSET ?'), [-1, 3],
+            limit_max=-1)
+        self.assertSQL(base.limit(0).offset(3), (
+            'SELECT "t1"."id" FROM "users" AS "t1" LIMIT ? OFFSET ?'), [0, 3],
+            limit_max=-1)
+
     def test_simple_join(self):
         query = (User
                  .select(
@@ -1594,6 +1617,29 @@ class TestSelectFeatures(BaseTestCase):
             'FILTER (WHERE ("t1"."dob" < ?)) '
             'FROM "person" AS "t1"'), [datetime.date(2000, 1, 1)])
 
+    def test_ordered_aggregate(self):
+        agg = fn.array_agg(Person.name).order_by(Person.id.desc())
+        self.assertSQL(Person.select(agg.alias('names')), (
+            'SELECT array_agg("t1"."name" ORDER BY "t1"."id" DESC) AS "names" '
+            'FROM "person" AS "t1"'), [])
+
+        agg = fn.string_agg(Person.name, ',').order_by(Person.dob, Person.id)
+        self.assertSQL(Person.select(agg), (
+            'SELECT string_agg("t1"."name", ? ORDER BY "t1"."dob", "t1"."id")'
+            ' FROM "person" AS "t1"'), [','])
+
+        agg = (fn.string_agg(Person.name.concat('-x'), ',')
+               .order_by(Person.name.desc(), Person.dob.asc()))
+        self.assertSQL(Person.select(agg), (
+            'SELECT string_agg(("t1"."name" || ?), ? ORDER BY "t1"."name" DESC'
+            ', "t1"."dob" ASC) '
+            'FROM "person" AS "t1"'), ['-x', ','])
+
+        agg = agg.order_by()
+        self.assertSQL(Person.select(agg), (
+            'SELECT string_agg(("t1"."name" || ?), ?) '
+            'FROM "person" AS "t1"'), ['-x', ','])
+
     def test_for_update(self):
         query = (Person
                  .select()
@@ -1624,6 +1670,39 @@ class TestSelectFeatures(BaseTestCase):
             'WHERE ("pa"."name" = ?) FOR UPDATE))'),
             ['charlie'],
             for_update=True)
+
+    def test_for_update_options(self):
+        query = (Person
+                 .select(Person.id)
+                 .where(Person.name == 'huey')
+                 .for_update(of=Person, nowait=True))
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "person" AS "t1" WHERE ("t1"."name" = ?) '
+            'FOR UPDATE OF "t1" NOWAIT'), ['huey'], for_update=True)
+
+        # Check default behavior.
+        query = query.for_update()
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "person" AS "t1" WHERE ("t1"."name" = ?) '
+            'FOR UPDATE'), ['huey'], for_update=True)
+
+        # Clear flag.
+        query = query.for_update(None)
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "person" AS "t1" WHERE ("t1"."name" = ?)'),
+            ['huey'])
+
+        # Old-style is still supported.
+        query = query.for_update('FOR UPDATE NOWAIT')
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "person" AS "t1" WHERE ("t1"."name" = ?) '
+            'FOR UPDATE NOWAIT'), ['huey'], for_update=True)
+
+        # Mix of old and new is OK.
+        query = query.for_update('FOR SHARE NOWAIT', of=Person)
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "person" AS "t1" WHERE ("t1"."name" = ?) '
+            'FOR SHARE OF "t1" NOWAIT'), ['huey'], for_update=True)
 
     def test_parentheses(self):
         query = (Person

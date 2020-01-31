@@ -14,6 +14,7 @@ from peewee import sort_models
 
 from .base import BaseTestCase
 from .base import DatabaseTestCase
+from .base import IS_CRDB
 from .base import IS_MYSQL
 from .base import IS_POSTGRESQL
 from .base import IS_SQLITE
@@ -512,7 +513,7 @@ class TestIntrospection(ModelTestCase):
     @requires_models(Note)
     def test_get_views(self):
         def normalize_view_meta(view_meta):
-            sql_ws_norm = re.sub('\n\s+', ' ', view_meta.sql)
+            sql_ws_norm = re.sub('\n\s+', ' ', view_meta.sql.strip('; '))
             return view_meta.name, (sql_ws_norm
                                     .replace('`peewee_test`.', '')
                                     .replace('`notes`.', '')
@@ -563,10 +564,18 @@ class TestIntrospection(ModelTestCase):
             assertViews([
                 ('notes_deleted',
                  ('SELECT notes.content FROM notes '
-                  'WHERE (notes.status = 9) ORDER BY notes.id DESC;')),
+                  'WHERE (notes.status = 9) ORDER BY notes.id DESC')),
                 ('notes_public',
                  ('SELECT notes.content, notes.ts FROM notes '
-                  'WHERE (notes.status = 1) ORDER BY notes.ts DESC;'))])
+                  'WHERE (notes.status = 1) ORDER BY notes.ts DESC'))])
+        elif IS_CRDB:
+            assertViews([
+                ('notes_deleted',
+                 ('SELECT content FROM peewee_test.public.notes '
+                  'WHERE status = 9 ORDER BY id DESC')),
+                ('notes_public',
+                 ('SELECT content, ts FROM peewee_test.public.notes '
+                  'WHERE status = 1 ORDER BY ts DESC'))])
 
     @requires_models(User, Tweet, Category)
     def test_get_foreign_keys(self):
@@ -806,3 +815,18 @@ class TestDatabaseConnection(DatabaseTestCase):
         curs = self.database.execute_sql('select * from foo')
         self.assertEqual(list(curs), [])
         self.database.execute_sql('drop table foo')
+
+
+class TestExceptionWrapper(ModelTestCase):
+    database = get_in_memory_db()
+    requires = [User]
+
+    def test_exception_wrapper(self):
+        exc = None
+        try:
+            User.create(username=None)
+        except IntegrityError as e:
+            exc = e
+
+        if exc is None: raise Exception('expected integrity error not raised')
+        self.assertTrue(exc.orig.__module__ != 'peewee')

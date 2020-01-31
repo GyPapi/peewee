@@ -1,4 +1,5 @@
 import datetime
+import json
 
 from peewee import *
 from playhouse.hybrid import *
@@ -405,7 +406,9 @@ class TestUpdateIntegrationRegressions(ModelTestCase):
             ['meow', 'hiss', 'purr', 'woof-x', 'bark-x'])
 
         # Subquery on the right-hand of the assignment.
-        subq = Tweet.select(fn.COUNT(Tweet.id)).where(Tweet.user == User.id)
+        subq = (Tweet
+                .select(fn.COUNT(Tweet.id).cast('text'))
+                .where(Tweet.user == User.id))
         res = User.update(username=(User.username + '-' + subq)).execute()
 
         self.assertEqual([u.username for u in users.clone()],
@@ -417,7 +420,7 @@ class TestUpdateIntegrationRegressions(ModelTestCase):
                 .select(SA.value)
                 .where(SA.value.in_([1.0, 3.0])))
         res = (Sample
-               .update(counter=(Sample.counter + Sample.value))
+               .update(counter=(Sample.counter + Sample.value.cast('int')))
                .where(Sample.value.in_(subq))
                .execute())
 
@@ -428,7 +431,9 @@ class TestUpdateIntegrationRegressions(ModelTestCase):
         self.assertEqual(list(query.clone()), [(0, 0.), (2, 1.), (2, 2.),
                                                (6, 3.)])
 
-        subq = SA.select(SA.counter - SA.value).where(SA.value == Sample.value)
+        subq = (SA
+                .select(SA.counter - SA.value.cast('int'))
+                .where(SA.value == Sample.value))
         res = (Sample
                .update(counter=subq)
                .where(Sample.value.in_([1., 3.]))
@@ -998,3 +1003,108 @@ class TestNoPKHashRegression(ModelTestCase):
 
         # Their hash is the same, though they are not equal.
         self.assertEqual(hash(npk), hash(npk_db))
+
+
+class Site(TestModel):
+    url = TextField()
+
+class Page(TestModel):
+    site = ForeignKeyField(Site, backref='pages')
+    title = TextField()
+
+class PageItem(TestModel):
+    page = ForeignKeyField(Page, backref='items')
+    content = TextField()
+
+
+class TestModelFilterJoinOrdering(ModelTestCase):
+    requires = [Site, Page, PageItem]
+
+    def setUp(self):
+        super(TestModelFilterJoinOrdering, self).setUp()
+        with self.database.atomic():
+            s1, s2 = [Site.create(url=s) for s in ('s1', 's2')]
+            p11, p12, p21 = [Page.create(site=s, title=t) for s, t in
+                             ((s1, 'p1-1'), (s1, 'p1-2'), (s2, 'p2-1'))]
+            items = (
+                (p11, 's1p1i1'),
+                (p11, 's1p1i2'),
+                (p11, 's1p1i3'),
+                (p12, 's1p2i1'),
+                (p21, 's2p1i1'))
+            PageItem.insert_many(items).execute()
+
+    def test_model_filter_join_ordering(self):
+        q = PageItem.filter(page__site__url='s1').order_by(PageItem.content)
+        self.assertSQL(q, (
+            'SELECT "t1"."id", "t1"."page_id", "t1"."content" '
+            'FROM "page_item" AS "t1" '
+            'INNER JOIN "page" AS "t2" ON ("t1"."page_id" = "t2"."id") '
+            'INNER JOIN "site" AS "t3" ON ("t2"."site_id" = "t3"."id") '
+            'WHERE ("t3"."url" = ?) ORDER BY "t1"."content"'), ['s1'])
+
+        def assertQ(q):
+            with self.assertQueryCount(1):
+                self.assertEqual([pi.content for pi in q],
+                                 ['s1p1i1', 's1p1i2', 's1p1i3', 's1p2i1'])
+
+        assertQ(q)
+
+        sid = Site.get(Site.url == 's1').id
+        q = (PageItem
+             .filter(page__site__url='s1', page__site__id=sid)
+             .order_by(PageItem.content))
+        assertQ(q)
+
+        q = (PageItem
+             .filter(page__site__id=sid)
+             .filter(page__site__url='s1')
+             .order_by(PageItem.content))
+        assertQ(q)
+
+        q = (PageItem
+             .filter(page__site__id=sid)
+             .filter(DQ(page__title='p1-1') | DQ(page__title='p1-2'))
+             .filter(page__site__url='s1')
+             .order_by(PageItem.content))
+        assertQ(q)
+
+
+class JsonField(TextField):
+    def db_value(self, value):
+        return json.dumps(value) if value is not None else None
+    def python_value(self, value):
+        if value is not None:
+            return json.loads(value)
+
+class JM(TestModel):
+    key = TextField()
+    data = JsonField()
+
+
+class TestListValueConversion(ModelTestCase):
+    requires = [JM]
+
+    def test_list_value_conversion(self):
+        jm = JM.create(key='k1', data=['i0', 'i1'])
+        jm.key = 'k1-x'
+        jm.save()
+
+        jm_db = JM.get(JM.key == 'k1-x')
+        self.assertEqual(jm_db.data, ['i0', 'i1'])
+
+        JM.update(data=['i1', 'i2']).execute()
+        jm_db = JM.get(JM.key == 'k1-x')
+        self.assertEqual(jm_db.data, ['i1', 'i2'])
+
+        jm2 = JM.create(key='k2', data=['i3', 'i4'])
+
+        jm_db.data = ['i1', 'i2', 'i3']
+        jm2.data = ['i4', 'i5']
+
+        JM.bulk_update([jm_db, jm2], fields=[JM.key, JM.data])
+
+        jm = JM.get(JM.key == 'k1-x')
+        self.assertEqual(jm.data, ['i1', 'i2', 'i3'])
+        jm2 = JM.get(JM.key == 'k2')
+        self.assertEqual(jm2.data, ['i4', 'i5'])
